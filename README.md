@@ -7,10 +7,13 @@ minimal dependencies (the gateway uses only the Go stdlib).
 
 [![CI](https://github.com/ginkida/logden/actions/workflows/ci.yml/badge.svg)](https://github.com/ginkida/logden/actions/workflows/ci.yml)
 
+> **AI agents:** see [AGENTS.md](AGENTS.md) — a step-by-step operating guide
+> with verifiable commands for deploying, sending logs, and querying.
+
 ## Features
 
 - **Simple universal API** — `POST /logs` with a shared token; a single object,
-  a JSON array, NDJSON, or gzip. Anything can write: Laravel, Node, Python, cron, bash.
+  a JSON array, NDJSON, or gzip. Any client can send: Laravel, Node, Python, cron, bash.
 - **Reliability (on the gateway side)** — batching, retries with backoff, a disk spool,
   and automatic replay: logs survive a brief outage and restart of
   ClickHouse. Clients, meanwhile, are deliberately thin and do not retry (see `clients/`).
@@ -219,7 +222,7 @@ buffer fill, insert latency, ClickHouse memory).
 | Component        | RAM     |
 |------------------|---------|
 | ClickHouse (cap) | ~768 MB (cgroup `mem_limit` 850m) |
-| logden   | ~10-15 MB (`mem_limit` 96m, `GOMEMLIMIT` 80MiB) |
+| logden           | ~10-15 MB (`mem_limit` 96m, `GOMEMLIMIT` 80MiB) |
 | OS + overhead    | ~150 MB |
 
 Measured at idle: gateway ~2 MB, ClickHouse ~190 MB. Gateway memory under load ≈

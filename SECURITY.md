@@ -28,7 +28,7 @@
 
 ## Defenses
 
-- Rate limiting (`RATE_LIMIT_RPS`) against abuse with a leaked token.
+- Rate limiting (`RATE_LIMIT_RPS`) against abuse via a leaked token.
 - `/metrics` without `METRICS_TOKEN` is open to everyone (the gateway logs a
   warning at startup): the build version and stream statistics leak out. If the
   gateway faces the internet, set `METRICS_TOKEN` or block the path at the

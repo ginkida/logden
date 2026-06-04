@@ -14,7 +14,7 @@ dmesg | grep -i oom            # common cause on a 1GB box — OOM
 docker compose restart clickhouse
 ```
 Data in the `ch-data` volume survives the restart. Logs accumulated during the outage sit in the
-spool (`gw-spool` volume) and **flush themselves** once it recovers (replay every
+spool (`gw-spool` volume) and **are replayed automatically** once it recovers (replay every
 `REPLAY_INTERVAL`). Loss only happens if both the buffer and the spool overflow
 (`logden_logs_dropped_total` > 0).
 
