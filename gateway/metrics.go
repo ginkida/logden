@@ -10,8 +10,8 @@ import (
 	"sync/atomic"
 )
 
-// Метрики в формате Prometheus text exposition — только stdlib, без зависимостей.
-// Счётчики атомарные; гистограмма и счётчики с лейблами — под мьютексом.
+// Metrics in Prometheus text exposition format — stdlib only, no dependencies.
+// Counters are atomic; the histogram and labeled counters are guarded by a mutex.
 
 var insertBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
 
@@ -89,9 +89,9 @@ type labeledCounter struct {
 
 func newLabeledCounter() *labeledCounter { return &labeledCounter{vals: map[string]int64{}} }
 
-// inc увеличивает счётчик для готовой строки лейблов вида `name="value"`.
-// Значения должны быть безопасными литералами (без " \ перевода строки) —
-// не подставляйте сюда пользовательский ввод без экранирования.
+// inc increments the counter for a ready-made label string of the form `name="value"`.
+// Values must be safe literals (no " \ or newlines) — do not pass unescaped
+// user input here.
 func (c *labeledCounter) inc(labels string) {
 	c.mu.Lock()
 	c.vals[labels]++
@@ -114,7 +114,7 @@ func (c *labeledCounter) render(b *strings.Builder, name string) {
 type histogram struct {
 	mu      sync.Mutex
 	buckets []float64
-	counts  []int64 // counts[i] = число наблюдений <= buckets[i] (кумулятивно)
+	counts  []int64 // counts[i] = number of observations <= buckets[i] (cumulative)
 	sum     float64
 	count   int64
 }

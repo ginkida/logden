@@ -1,8 +1,8 @@
 -- =====================================================================
--- Аналитика (под reader-юзера / агента)
+-- Analytics (for the reader user / agent)
 -- =====================================================================
 
--- Топ ошибок по проектам за последние 24 часа
+-- Top errors per project over the last 24 hours
 SELECT project, count() AS errors
 FROM logs.logs
 WHERE timestamp > now() - INTERVAL 24 HOUR
@@ -10,42 +10,42 @@ WHERE timestamp > now() - INTERVAL 24 HOUR
 GROUP BY project
 ORDER BY errors DESC;
 
--- Динамика по уровням, по часам, за сутки
+-- Per-level trend, hourly, over one day
 SELECT toStartOfHour(timestamp) AS hour, level, count() AS n
 FROM logs.logs
 WHERE timestamp > now() - INTERVAL 24 HOUR
 GROUP BY hour, level
 ORDER BY hour, level;
 
--- Последние ошибки конкретного проекта
+-- Latest errors for a specific project
 SELECT timestamp, level, message, context
 FROM logs.logs
 WHERE project = 'billing-api' AND level = 'error'
 ORDER BY timestamp DESC
 LIMIT 50;
 
--- Поиск по полю внутри context (JSON хранится строкой)
+-- Search a field inside context (JSON stored as a string)
 SELECT timestamp, project, message, JSONExtractInt(context, 'order_id') AS order_id
 FROM logs.logs
 WHERE JSONExtractInt(context, 'order_id') = 123
 ORDER BY timestamp DESC;
 
--- Полнотекстовый поиск по сообщению.
--- hasToken использует skip-индекс idx_msg_tokens (быстро, без полного скана).
+-- Full-text search over the message.
+-- hasToken uses the idx_msg_tokens skip index (fast, no full scan).
 SELECT timestamp, project, level, message
 FROM logs.logs
 WHERE hasToken(message, 'timeout')
   AND timestamp > now() - INTERVAL 7 DAY
 ORDER BY timestamp DESC
 LIMIT 100;
--- Для произвольной подстроки (медленнее, индекс не работает): message ILIKE '%timeou%'
+-- For an arbitrary substring (slower, the index does not apply): message ILIKE '%timeou%'
 
 -- =====================================================================
--- Здоровье / мониторинг (нужны системные GRANT'ы для reader)
+-- Health / monitoring (reader needs system GRANTs)
 -- =====================================================================
 
--- Размер хранилища логов на диске (байты берём из system.parts:
--- в system.columns эти колонки не заполняются и дают 0).
+-- On-disk size of log storage (bytes come from system.parts:
+-- in system.columns these columns are not populated and read 0).
 SELECT
     formatReadableSize(sum(data_compressed_bytes))   AS compressed,
     formatReadableSize(sum(data_uncompressed_bytes)) AS uncompressed,
@@ -53,24 +53,24 @@ SELECT
 FROM system.parts
 WHERE database = 'logs' AND table = 'logs' AND active;
 
--- ТИХИЕ потери: ошибки async-вставок за последний час (status != 'Ok').
--- ВНИМАНИЕ: таблица создаётся лениво — до первой async-вставки её нет (UNKNOWN_TABLE).
+-- SILENT loss: async insert errors over the last hour (status != 'Ok').
+-- NOTE: the table is created lazily — until the first async insert it does not exist (UNKNOWN_TABLE).
 SELECT status, count() AS n
 FROM system.asynchronous_insert_log
 WHERE event_time > now() - INTERVAL 1 HOUR
 GROUP BY status;
 
--- Число активных партов по партициям (рост = мерджи не успевают)
+-- Number of active parts per partition (growth = merges falling behind)
 SELECT partition, count() AS parts
 FROM system.parts
 WHERE database = 'logs' AND table = 'logs' AND active
 GROUP BY partition
 ORDER BY partition DESC;
 
--- Память ClickHouse относительно потолка (768 МБ)
+-- ClickHouse memory relative to the cap (768 MB)
 SELECT metric, formatReadableSize(value) AS v
 FROM system.asynchronous_metrics
 WHERE metric IN ('MemoryResident', 'MemoryTracking');
 
--- Накопленные ошибки сервера
+-- Accumulated server errors
 SELECT name, value FROM system.errors WHERE value > 0 ORDER BY value DESC;

@@ -1,13 +1,13 @@
-# Клиенты
+# Clients
 
-Тонкие клиенты для `POST /logs`. Все — без внешних зависимостей, с опциональным
-батчингом. Контракт один: `{ project, level, message, context }` + `Authorization: Bearer`.
+Thin clients for `POST /logs`. All dependency-free, with optional
+batching. One contract: `{ project, level, message, context }` + `Authorization: Bearer`.
 
-Клиенты **не ретраят и не спулят**: при недоступности шлюза одиночная отправка
-вернёт ошибку, а batch-режим потеряет батч молча (фоновый флашер ошибки глотает).
-Надёжность (ретраи, спул, реплей) живёт на участке шлюз → ClickHouse. Свой батч
-держите ≤ 1000 событий (`MAX_BATCH_EVENTS` шлюза). Без `close()` в batch-режиме
-остаток буфера не отправится.
+The clients **do not retry or spool**: if the gateway is down, a single send
+returns an error, and batch mode drops the batch silently (the background flusher swallows errors).
+Reliability (retries, spool, replay) lives on the gateway → ClickHouse leg. Keep your own batch
+≤ 1000 events (the gateway's `MAX_BATCH_EVENTS`). Without `close()` in batch mode
+the remaining buffer is not flushed.
 
 ## Go (`clients/go`)
 
@@ -38,4 +38,4 @@ await log.error("boom", { path: "/checkout" });
 await log.close();
 ```
 
-Для Laravel см. `examples/LoggerGatewayHandler.php`. Для голого `curl` — `examples/curl.sh`.
+For Laravel see `examples/LoggerGatewayHandler.php`. For bare `curl` — `examples/curl.sh`.

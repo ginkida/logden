@@ -1,26 +1,26 @@
 <?xml version="1.0"?>
 <!--
-  Профили и лимиты. Положить в: /etc/clickhouse-server/users.d/low-mem.xml
+  Profiles and limits. Place in: /etc/clickhouse-server/users.d/low-mem.xml
 -->
 <clickhouse>
     <profiles>
-        <!-- профиль по умолчанию: под ним ходит writer (вставки) -->
+        <!-- default profile: used by the writer (inserts) -->
         <default>
-            <max_memory_usage>536870912</max_memory_usage>                       <!-- 512 МБ на запрос -->
+            <max_memory_usage>536870912</max_memory_usage>                       <!-- 512 MB per query -->
             <max_bytes_before_external_group_by>268435456</max_bytes_before_external_group_by>
             <async_insert>1</async_insert>
             <wait_for_async_insert>0</wait_for_async_insert>
-            <async_insert_busy_timeout_ms>2000</async_insert_busy_timeout_ms>    <!-- реже флашим => крупнее части -->
-            <async_insert_max_data_size>3145728</async_insert_max_data_size>     <!-- 3 МБ потолок буфера -->
-            <async_insert_deduplicate>0</async_insert_deduplicate>              <!-- НЕ терять одинаковые лог-строки -->
+            <async_insert_busy_timeout_ms>2000</async_insert_busy_timeout_ms>    <!-- flush less often => bigger parts -->
+            <async_insert_max_data_size>3145728</async_insert_max_data_size>     <!-- 3 MB buffer ceiling -->
+            <async_insert_deduplicate>0</async_insert_deduplicate>              <!-- do NOT drop identical log rows -->
         </default>
 
-        <!-- профиль reader: лимиты + readonly-режим. Имя 'readonly' наследует
-             <readonly>1</readonly> от одноимённого stock-профиля, поэтому reader
-             НЕ может менять настройки per-query и обойти эти лимиты. Это намеренно
-             (защита от OOM от одной тяжёлой аналитики/агента). -->
+        <!-- reader profile: limits + readonly mode. The name 'readonly' inherits
+             <readonly>1</readonly> from the stock profile of the same name, so the
+             reader CANNOT change settings per-query and bypass these limits. This is
+             intentional (protection from OOM caused by one heavy analytics query/agent). -->
         <readonly>
-            <max_memory_usage>314572800</max_memory_usage>                       <!-- 300 МБ на запрос -->
+            <max_memory_usage>314572800</max_memory_usage>                       <!-- 300 MB per query -->
             <max_bytes_before_external_group_by>157286400</max_bytes_before_external_group_by>
             <max_execution_time>30</max_execution_time>
             <max_threads>2</max_threads>

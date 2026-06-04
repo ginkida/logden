@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <!--
-  Диск для нативного BACKUP/RESTORE (без внешних зависимостей).
-  Путь лежит внутри тома ch-data (writable). Для настоящего DR копируйте
-  получившиеся бэкапы на другой хост (см. deploy/backup.sh).
+  Disk for native BACKUP/RESTORE (no external dependencies).
+  The path lives inside the ch-data volume (writable). For real DR, copy the
+  resulting backups to another host (see deploy/backup.sh).
 -->
 <clickhouse>
     <storage_configuration>

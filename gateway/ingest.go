@@ -19,8 +19,8 @@ import (
 	"time"
 )
 
-// chStatusError — ClickHouse ответил HTTP-статусом ошибки (в отличие от
-// транспортного сбоя, когда ответа не было вовсе).
+// chStatusError means ClickHouse replied with an error HTTP status (as opposed
+// to a transport failure, where there was no response at all).
 type chStatusError struct {
 	code int
 	msg  string
@@ -28,10 +28,10 @@ type chStatusError struct {
 
 func (e *chStatusError) Error() string { return fmt.Sprintf("clickhouse %d: %s", e.code, e.msg) }
 
-// ingester — конвейер приёма: ограниченный буфер -> батч-воркер -> вставка в
-// ClickHouse с ретраями. При исчерпании ретраев батч уходит в дисковый спул
-// (если включён) и переигрывается позже. Это закрывает потерю логов на
-// кратких сбоях/деплоях и переполнении.
+// ingester is the ingest pipeline: a bounded buffer -> batch worker -> insert
+// into ClickHouse with retries. When retries are exhausted the batch goes to
+// the disk spool (if enabled) and is replayed later. This prevents log loss on
+// brief outages/deploys and on overflow.
 type ingester struct {
 	cfg       config
 	m         *metrics
@@ -40,7 +40,7 @@ type ingester struct {
 	insertURL string
 	wg        sync.WaitGroup
 	enqueueMu sync.Mutex
-	closed    bool // под enqueueMu: канал закрыт, enqueue больше не шлёт
+	closed    bool // under enqueueMu: channel closed, enqueue no longer sends
 
 	spoolMu    sync.Mutex
 	spoolSeq   uint64
@@ -59,7 +59,7 @@ func newIngester(cfg config, m *metrics) *ingester {
 			"INSERT INTO %s.%s (timestamp, project, level, message, context, source_ip) FORMAT JSONEachRow",
 			cfg.chDatabase, cfg.chTable)},
 		"async_insert":          {"1"},
-		"wait_for_async_insert": {"1"}, // ждём подтверждения флаша => знаем об ошибке
+		"wait_for_async_insert": {"1"}, // wait for the flush to be acked => we learn about errors
 	}.Encode()
 
 	return &ingester{
@@ -75,10 +75,10 @@ func newIngester(cfg config, m *metrics) *ingester {
 func (ing *ingester) depth() int    { return len(ing.ch) }
 func (ing *ingester) capacity() int { return cap(ing.ch) }
 
-// enqueue сериализует строки, проставляет source_ip и неблокирующе кладёт в
-// буфер. Возвращает число принятых и отброшенных (буфер полон).
+// enqueue serializes the rows, stamps source_ip and non-blockingly puts them
+// into the buffer. Returns the number of accepted and dropped (buffer full) rows.
 func (ing *ingester) enqueue(rows []row, ip string) (accepted, dropped int) {
-	// Сериализуем строки вне блокировки (CPU не держит мьютекс).
+	// Serialize the rows outside the lock (CPU work doesn't hold the mutex).
 	lines := make([][]byte, 0, len(rows))
 	for i := range rows {
 		rows[i].SourceIP = ip
@@ -88,9 +88,10 @@ func (ing *ingester) enqueue(rows []row, ip string) (accepted, dropped int) {
 			dropped++
 		}
 	}
-	// Всё-или-ничего ПОД мьютексом: проверка вместимости и постановка атомарны
-	// относительно других хендлеров (иначе ретрай батча давал бы дубликаты уже
-	// принятых строк). Воркер только вычитывает, так что под локом место не убывает.
+	// All-or-nothing UNDER the mutex: the capacity check and the enqueue are
+	// atomic with respect to other handlers (otherwise a batch retry would
+	// duplicate already-accepted rows). The worker only reads, so free space
+	// can't shrink while we hold the lock.
 	ing.enqueueMu.Lock()
 	defer ing.enqueueMu.Unlock()
 	if ing.closed || len(ing.ch)+len(lines) > cap(ing.ch) {
@@ -115,7 +116,7 @@ func (ing *ingester) start() {
 		if err := os.MkdirAll(ing.cfg.spoolDir, 0o750); err != nil {
 			slog.Error("cannot create spool dir", "dir", ing.cfg.spoolDir, "err", err)
 		} else {
-			ing.cleanupTmp() // до воркера/реплея: мёртвые .tmp от крэша между записью и rename
+			ing.cleanupTmp() // before worker/replay: dead .tmp from a crash between write and rename
 			ing.updateSpoolGauge()
 			ing.wg.Add(1)
 			go ing.replayLoop()
@@ -123,18 +124,19 @@ func (ing *ingester) start() {
 	}
 }
 
-// stop вызывается после остановки HTTP-сервера (handlers уже не пишут):
-// закрываем буфер, воркер дренирует остаток и флашит, ждём завершения.
+// stop is called after the HTTP server has stopped (handlers no longer write):
+// close the buffer, the worker drains the remainder and flushes, then we wait
+// for completion.
 func (ing *ingester) stop() {
-	ing.draining.Store(true) // на дренаже не залипаем в долгих ретраях — сразу спул
-	close(ing.stopReplay)    // остановить реплей ДО дренажа (без гонки за каталог)
-	// Закрываем канал СИНХРОННО с enqueue: иначе send-on-closed-channel паника
-	// (Shutdown мог истечь по таймауту, оставив медленный handler в enqueue).
+	ing.draining.Store(true) // while draining don't get stuck in long retries — spool right away
+	close(ing.stopReplay)    // stop replay BEFORE draining (no race on the directory)
+	// Close the channel SYNCHRONOUSLY with enqueue: otherwise a send-on-closed-channel
+	// panic (Shutdown may have timed out, leaving a slow handler inside enqueue).
 	ing.enqueueMu.Lock()
 	ing.closed = true
 	close(ing.ch)
 	ing.enqueueMu.Unlock()
-	ing.wg.Wait() // ждём и worker, и replayLoop
+	ing.wg.Wait() // wait for both worker and replayLoop
 }
 
 func (ing *ingester) worker() {
@@ -183,7 +185,7 @@ func (ing *ingester) insertWithRetry(body []byte) error {
 	var err error
 	retries := ing.cfg.maxRetries
 	if ing.draining.Load() {
-		retries = 0 // shutdown: одна попытка, остаток в спул (durable), не залипаем
+		retries = 0 // shutdown: one attempt, remainder to spool (durable), don't get stuck
 	}
 	backoff := 200 * time.Millisecond
 	for attempt := 0; attempt <= retries; attempt++ {
@@ -234,7 +236,7 @@ func (ing *ingester) insertOnce(body []byte) error {
 	return nil
 }
 
-// --- дисковый спул ---
+// --- disk spool ---
 
 func (ing *ingester) spool(body []byte, n int) {
 	if ing.cfg.spoolDir == "" {
@@ -289,7 +291,7 @@ func (ing *ingester) replayOnce() {
 	names := ing.spoolFilesList()
 	for _, name := range names {
 		select {
-		case <-ing.stopReplay: // shutdown: не залипаем в полном свипе спула
+		case <-ing.stopReplay: // shutdown: don't get stuck in a full spool sweep
 			return
 		default:
 		}
@@ -299,18 +301,19 @@ func (ing *ingester) replayOnce() {
 			continue
 		}
 		if err := ing.insertOnce(body); err != nil {
-			// 400 = ClickHouse разобрал запрос и отверг сами данные (битый файл,
-			// несовместимость после миграции). Ретраи бесполезны, а вечный return
-			// блокировал бы весь спул за этим файлом — карантиним в .bad и идём
-			// дальше. Остальные ошибки (транспорт, 5xx, auth) — временные/общие:
-			// прерываем свип до следующего тика, как раньше.
+			// 400 = ClickHouse parsed the request and rejected the data itself
+			// (corrupt file, incompatibility after a migration). Retries are
+			// useless, and an indefinite return would block the whole spool
+			// behind this file — quarantine it as .bad and move on. Other errors
+			// (transport, 5xx, auth) are transient/global: abort the sweep until
+			// the next tick, as before.
 			var se *chStatusError
 			if errors.As(err, &se) && se.code == http.StatusBadRequest {
 				ing.quarantine(path, name, body, err)
 				continue
 			}
 			slog.Warn("spool replay failed, will retry later", "file", name, "err", err)
-			return // ClickHouse ещё недоступен — следующий тик
+			return // ClickHouse still unavailable — wait for the next tick
 		}
 		n := bytes.Count(body, []byte("\n")) + 1
 		ing.m.inserted.Add(int64(n))
@@ -319,9 +322,9 @@ func (ing *ingester) replayOnce() {
 	}
 }
 
-// quarantine убирает отвергнутый ClickHouse'ом файл из очереди реплея,
-// переименовывая его в *.bad (suffix-фильтр спула его больше не видит).
-// Файл остаётся на диске для ручного разбора — см. RUNBOOK.
+// quarantine removes a file rejected by ClickHouse from the replay queue by
+// renaming it to *.bad (the spool's suffix filter no longer sees it). The file
+// stays on disk for manual inspection — see RUNBOOK.
 func (ing *ingester) quarantine(path, name string, body []byte, cause error) {
 	bad := path + ".bad"
 	if err := os.Rename(path, bad); err != nil {
@@ -329,14 +332,14 @@ func (ing *ingester) quarantine(path, name string, body []byte, cause error) {
 		return
 	}
 	n := bytes.Count(body, []byte("\n")) + 1
-	ing.m.dropped.Add(int64(n)) // доставка не состоялась — это потеря, алерт должен сработать
+	ing.m.dropped.Add(int64(n)) // delivery didn't happen — this is loss, the alert should fire
 	ing.m.spoolQuarantined.Add(1)
 	slog.Error("spool batch rejected by clickhouse, quarantined", "file", name+".bad", "events", n, "err", cause)
 	ing.updateSpoolGauge()
 }
 
-// cleanupTmp удаляет осиротевшие *.tmp (крэш между WriteFile и Rename):
-// их никто не реплеит, лимит SPOOL_MAX_FILES их не учитывает.
+// cleanupTmp removes orphaned *.tmp files (crash between WriteFile and Rename):
+// nobody replays them, and the SPOOL_MAX_FILES limit doesn't count them.
 func (ing *ingester) cleanupTmp() {
 	entries, err := os.ReadDir(ing.cfg.spoolDir)
 	if err != nil {

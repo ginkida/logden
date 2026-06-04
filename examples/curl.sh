@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Отправка логов из чего угодно — одна команда.
+# Ship logs from anything — a single command.
 set -euo pipefail
 
 : "${LOG_TOKEN:?set LOG_TOKEN}"
 ENDPOINT="${ENDPOINT:-http://localhost:8080}"
 AUTH=(-H "Authorization: Bearer $LOG_TOKEN" -H "Content-Type: application/json")
 
-# одиночный лог
+# single log
 curl -fsS -X POST "$ENDPOINT/logs" "${AUTH[@]}" \
   -d '{"project":"billing-api","level":"error","message":"Payment gateway timeout","context":{"order_id":123}}'
 
-# батч (JSON-массив)
+# batch (JSON array)
 curl -fsS -X POST "$ENDPOINT/logs" "${AUTH[@]}" \
   -d '[{"project":"web","message":"login"},{"project":"web","level":"warn","message":"slow query"}]'
 

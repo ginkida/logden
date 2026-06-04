@@ -1,9 +1,10 @@
 <?xml version="1.0"?>
 <!--
-  default нужен access management, чтобы init-скрипт создал writer/reader.
-  Ограничиваем default только loopback: init и healthcheck ходят локально, а из
-  docker-сети (от шлюза) работают writer/reader по своим кредам. Это закрывает
-  доступ к беспарольному default из сети без правки init.
+  default needs access management so the init script can create writer/reader.
+  We restrict default to loopback only: init and the healthcheck connect locally,
+  while from the docker network (from the gateway) the writer/reader use their own
+  credentials. This closes off access to the passwordless default from the network
+  without touching init.
 -->
 <clickhouse>
     <users>

@@ -1,9 +1,9 @@
-// Package logden — крошечный клиент для ingest-шлюза logden (только stdlib).
+// Package logden is a tiny client for the logden ingest gateway (stdlib only).
 //
 //	c := logden.New("http://logs.internal:8080", token, "billing-api")
 //	c.Error("payment timeout", map[string]any{"order_id": 123})
 //
-// Опционально с батчингом:
+// Optionally with batching:
 //
 //	c := logden.New(ep, token, "web", logden.WithBatch(500, time.Second))
 //	defer c.Close()
@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-// Event — одно событие в контракте /logs.
+// Event is a single event in the /logs contract.
 type Event struct {
 	Project string         `json:"project"`
 	Level   string         `json:"level,omitempty"`
@@ -28,7 +28,7 @@ type Event struct {
 	Context map[string]any `json:"context,omitempty"`
 }
 
-// Client шлёт события в шлюз. Безопасен для конкурентного использования.
+// Client sends events to the gateway. Safe for concurrent use.
 type Client struct {
 	endpoint string
 	token    string
@@ -46,11 +46,11 @@ type Client struct {
 
 type Option func(*Client)
 
-// WithHTTPClient подменяет HTTP-клиент (таймауты, транспорт).
+// WithHTTPClient swaps in a custom HTTP client (timeouts, transport).
 func WithHTTPClient(h *http.Client) Option { return func(c *Client) { c.http = h } }
 
-// WithBatch включает асинхронный батчинг: события копятся до size или флашатся
-// по интервалу interval. Требует Close() на завершении.
+// WithBatch enables async batching: events accumulate until size is reached or
+// are flushed every interval. Requires Close() on shutdown.
 func WithBatch(size int, interval time.Duration) Option {
 	return func(c *Client) { c.batch = size; c.interval = interval }
 }
@@ -76,7 +76,7 @@ func New(endpoint, token, project string, opts ...Option) *Client {
 	return c
 }
 
-// Log записывает событие: в batch-режиме буферизует, иначе шлёт сразу.
+// Log records an event: it buffers in batch mode, otherwise sends immediately.
 func (c *Client) Log(level, message string, fields map[string]any) error {
 	e := Event{Project: c.project, Level: level, Message: message, Context: fields}
 	if c.batch > 0 {
@@ -96,7 +96,7 @@ func (c *Client) Info(msg string, f map[string]any) error  { return c.Log("info"
 func (c *Client) Warn(msg string, f map[string]any) error  { return c.Log("warning", msg, f) }
 func (c *Client) Error(msg string, f map[string]any) error { return c.Log("error", msg, f) }
 
-// Flush немедленно отправляет накопленный батч.
+// Flush sends the buffered batch right away.
 func (c *Client) Flush() error {
 	c.mu.Lock()
 	if len(c.buf) == 0 {
@@ -109,10 +109,10 @@ func (c *Client) Flush() error {
 	return c.send(batch)
 }
 
-// Close останавливает фоновый флашер и досылает остаток (batch-режим).
+// Close stops the background flusher and sends what's left (batch mode).
 func (c *Client) Close() error {
 	if c.batch > 0 {
-		c.closeOnce.Do(func() { // идемпотентно: повторный Close не паникует
+		c.closeOnce.Do(func() { // idempotent: a second Close won't panic
 			close(c.stop)
 			c.wg.Wait()
 		})

@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-// Прогон против реального ClickHouse. Запуск:
+// Run against a real ClickHouse. Run with:
 //
 //	CLICKHOUSE_URL=http://localhost:8123 CLICKHOUSE_USER=default \
 //	  go test -tags=integration ./...
@@ -65,7 +65,7 @@ func TestIntegrationInsert(t *testing.T) {
 	}
 }
 
-// applySchema накатывает clickhouse/schema.sql (несколько DDL через ';').
+// applySchema applies clickhouse/schema.sql (several DDL statements split on ';').
 func applySchema(t *testing.T, base, user, key string) {
 	t.Helper()
 	data, err := os.ReadFile("../clickhouse/schema.sql")
@@ -74,7 +74,7 @@ func applySchema(t *testing.T, base, user, key string) {
 	}
 	for _, stmt := range strings.Split(string(data), ";") {
 		if isCommentOnly(stmt) {
-			continue // split по ';' может отрезать комментарий — не шлём чанки без SQL
+			continue // splitting on ';' may carve off a comment — skip chunks with no SQL
 		}
 		chQuery(t, base, user, key, stmt)
 	}

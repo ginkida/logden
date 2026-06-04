@@ -7,10 +7,10 @@ use Monolog\Handler\AbstractProcessingHandler;
 use Monolog\LogRecord;
 
 /**
- * Кастомный Monolog-handler: шлёт записи в logden.
- * Совместим с Laravel 9+/Monolog 3.
+ * Custom Monolog handler: ships records to logden.
+ * Compatible with Laravel 9+ / Monolog 3.
  *
- * 1) config/logging.php → в массив 'channels' добавить:
+ * 1) config/logging.php → add to the 'channels' array:
  *
  *    'remote' => [
  *        'driver'  => 'monolog',
@@ -20,11 +20,11 @@ use Monolog\LogRecord;
  *
  * 2) .env:
  *    LOG_GATEWAY_URL=http://logs.internal:8080
- *    LOG_GATEWAY_TOKEN=общий_секрет
+ *    LOG_GATEWAY_TOKEN=shared_secret
  *    LOG_GATEWAY_PROJECT=billing-api
  *
- * 3) Слать:  Log::channel('remote')->error('...', ['order_id' => 123]);
- *    или сделать 'remote' частью стека в LOG_CHANNEL.
+ * 3) Usage:  Log::channel('remote')->error('...', ['order_id' => 123]);
+ *    or make 'remote' part of the stack in LOG_CHANNEL.
  */
 class LoggerGatewayHandler extends AbstractProcessingHandler
 {
@@ -40,8 +40,8 @@ class LoggerGatewayHandler extends AbstractProcessingHandler
                     'context' => $record->context,
                 ]);
         } catch (\Throwable $e) {
-            // Логирование не должно ронять запрос. Для высоконагруженных
-            // путей логику отправки лучше унести в очередь (dispatch).
+            // Logging must never break the request. On high-traffic
+            // paths, move the send logic to a queue (dispatch).
         }
     }
 }

@@ -1,10 +1,11 @@
-// logden — production-шлюз приёма логов.
+// logden — production log ingest gateway.
 //
-// Контракт: POST /logs с общим токеном в Authorization: Bearer.
-// Тело: один объект, JSON-массив или NDJSON; поля {project, level, message,
-// context, timestamp}. Шлюз валидирует, батчит, вставляет в ClickHouse с
-// ретраями и (опционально) дисковым спулом. Эндпоинты: /healthz (liveness),
-// /readyz (проверяет ClickHouse), /metrics (Prometheus), /version.
+// Contract: POST /logs with a shared token in Authorization: Bearer.
+// Body: a single object, a JSON array, or NDJSON; fields {project, level,
+// message, context, timestamp}. The gateway validates, batches, and inserts
+// into ClickHouse with retries and (optionally) a disk spool. Endpoints:
+// /healthz (liveness), /readyz (checks ClickHouse), /metrics (Prometheus),
+// /version.
 package main
 
 import (
@@ -21,7 +22,7 @@ import (
 	"time"
 )
 
-// Заполняется через -ldflags при сборке.
+// Populated via -ldflags at build time.
 var (
 	version   = "dev"
 	commit    = "none"
@@ -61,7 +62,7 @@ type config struct {
 }
 
 func main() {
-	// Режим healthcheck для docker (distroless без shell/curl).
+	// Healthcheck mode for docker (distroless has no shell/curl).
 	if len(os.Args) > 1 && os.Args[1] == "-healthcheck" {
 		os.Exit(healthcheckProbe())
 	}
@@ -81,8 +82,9 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
-	// Фоновая проба ClickHouse: метрика logden_clickhouse_reachable обновляется
-	// независимо от внешних /readyz (иначе алерт на неё мёртв без проб извне).
+	// Background ClickHouse probe: the logden_clickhouse_reachable metric is
+	// updated independently of external /readyz calls (otherwise the alert on it
+	// is dead without probes from outside).
 	go srv.ready.loop(ctx)
 
 	httpServer := &http.Server{
@@ -107,15 +109,15 @@ func main() {
 	<-ctx.Done()
 	slog.Info("shutdown signal received, draining")
 
-	// Бюджет shutdown должен укладываться в docker stop_grace_period (45s):
-	// 15s на дренаж HTTP-соединений + дренаж буфера
-	// (ceil(BUFFER_SIZE/BATCH_SIZE) × insertOnce 3s при draining).
+	// The shutdown budget must fit within docker stop_grace_period (45s):
+	// 15s to drain HTTP connections + buffer drain
+	// (ceil(BUFFER_SIZE/BATCH_SIZE) × insertOnce 3s while draining).
 	shCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := httpServer.Shutdown(shCtx); err != nil {
 		slog.Error("http shutdown error", "err", err)
 	}
-	srv.ingest.stop() // дренируем буфер и флашим остаток
+	srv.ingest.stop() // drain the buffer and flush the remainder
 	slog.Info("drained, exiting")
 }
 

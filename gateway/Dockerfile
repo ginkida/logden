@@ -12,13 +12,13 @@ RUN CGO_ENABLED=0 go build \
       -o /logden . \
  && mkdir -p /spool
 
-# ---- run ----  (статичный бинарь в минимальном distroless-образе)
+# ---- run ----  (static binary in a minimal distroless image)
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:d093aa3e30dbadd3efe1310db061a14da60299baff8450a17fe0ccc514a16639
 LABEL org.opencontainers.image.title="logden" \
       org.opencontainers.image.source="https://github.com/ginkida/logden" \
       org.opencontainers.image.licenses="MIT"
 COPY --from=build /logden /logden
-# /spool владеет nonroot (65532) — пустой named volume унаследует этого владельца
+# /spool is owned by nonroot (65532) — an empty named volume inherits this owner
 COPY --from=build --chown=65532:65532 /spool /spool
 EXPOSE 8080
 ENTRYPOINT ["/logden"]

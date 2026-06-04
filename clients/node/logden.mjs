@@ -1,10 +1,10 @@
-// Крошечный клиент для ingest-шлюза logden (Node 18+, глобальный fetch).
+// Tiny client for the logden ingest gateway (Node 18+, global fetch).
 //
 //   import { LoggerClient } from "./logden.mjs";
 //   const log = new LoggerClient("http://logs.internal:8080", TOKEN, "web");
 //   await log.error("boom", { path: "/checkout" });
 //
-// С батчингом:
+// With batching:
 //   const log = new LoggerClient(EP, TOKEN, "web", { batch: 500, interval: 1000 });
 //   await log.close();
 
@@ -26,8 +26,8 @@ export class LoggerClient {
     if (context) event.context = context;
     if (this.batch > 0) {
       this.buf.push(event);
-      // batch-режим — fire-and-forget: не пробрасываем ошибку наружу, иначе
-      // незаawait-ленный log() даёт unhandledRejection и может уронить процесс.
+      // batch mode is fire-and-forget: don't surface the error, otherwise an
+      // unawaited log() triggers unhandledRejection and may crash the process.
       if (this.buf.length >= this.batch) this.flush().catch(() => {});
       return;
     }

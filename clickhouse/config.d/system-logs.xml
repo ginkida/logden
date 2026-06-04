@@ -1,9 +1,9 @@
 <?xml version="1.0"?>
 <!--
-  Ограничиваем рост системных лог-таблиц ClickHouse: по умолчанию у них нет TTL
-  и они растут бесконечно, а на 1 ГБ-боксе это главный незаметный пожиратель
-  диска и памяти (фоновые мерджи). Тяжёлые и бесполезные для этого проекта логи
-  отключаем (remove="1"), остальные держим 3 дня.
+  Cap the growth of ClickHouse system log tables: by default they have no TTL
+  and grow unboundedly, and on a 1 GB box this is the main invisible consumer
+  of disk and memory (background merges). Logs that are heavy and useless for
+  this project are disabled (remove="1"); the rest are kept for 3 days.
 -->
 <clickhouse>
     <query_log>
@@ -21,7 +21,7 @@
         <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
         <flush_interval_milliseconds>60000</flush_interval_milliseconds>
     </asynchronous_metric_log>
-    <!-- держим лог async-вставок: по нему видны ТИХИЕ потери логов -->
+    <!-- keep the async insert log: it reveals SILENT log loss -->
     <asynchronous_insert_log>
         <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
     </asynchronous_insert_log>

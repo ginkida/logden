@@ -1,8 +1,8 @@
-# секреты / локальная конфигурация
+# secrets / local config
 .env
 docker-compose.override.yml
 
-# собранный бинарь шлюза и покрытие
+# built gateway binary and coverage
 /gateway/logden
 /gateway/coverage.out
 *.out
@@ -16,6 +16,6 @@ docker-compose.override.yml
 # python
 __pycache__/
 
-# harness / session-стейт
+# harness / session state
 .claude/
 CLAUDE.md

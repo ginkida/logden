@@ -1,19 +1,19 @@
-# Доступ агента к логам (SQL / MCP)
+# Agent access to logs (SQL / MCP)
 
-Анализ — обычный SQL под read-only пользователем `reader` (только `SELECT`,
-профиль с лимитами памяти/времени + readonly-режим, доступ к нужным system-таблицам).
-Агент не может ни писать, ни обойти лимиты.
+Analysis is plain SQL under the read-only `reader` user (`SELECT` only,
+a profile with memory/time limits + readonly mode, access to the needed system tables).
+The agent can neither write nor bypass the limits.
 
-## Где живёт ClickHouse
+## Where ClickHouse lives
 
-По умолчанию порты ClickHouse наружу НЕ публикуются (только docker-сеть). Чтобы
-агент/MCP-сервер достучался, есть два пути.
+By default the ClickHouse ports are NOT published externally (docker network only). To
+let an agent/MCP server reach it, there are two paths.
 
-### A. Открыть HTTP только на loopback (локальный агент)
+### A. Expose HTTP on loopback only (local agent)
 
-Скопируйте `docker-compose.override.yml.example` → `docker-compose.override.yml`
-(подхватывается автоматически). Он биндит 8123 только на `127.0.0.1` — наружу
-порт по-прежнему закрыт:
+Copy `docker-compose.override.yml.example` → `docker-compose.override.yml`
+(picked up automatically). It binds 8123 to `127.0.0.1` only — externally the
+port stays closed:
 
 ```yaml
 services:
@@ -22,14 +22,14 @@ services:
       - "127.0.0.1:8123:8123"
 ```
 
-### B. MCP-сервер в той же docker-сети
+### B. MCP server on the same docker network
 
-Запустите ClickHouse-MCP сервисом в compose — он ходит к `clickhouse:8123` по
-внутренней сети, и публиковать порт CH наружу не нужно.
+Run ClickHouse-MCP as a service in compose — it talks to `clickhouse:8123` over
+the internal network, so there's no need to publish the CH port externally.
 
-## MCP-сервер ClickHouse
+## ClickHouse MCP server
 
-Официальный сервер — `mcp-clickhouse`. Конфиг указывает на `reader`:
+The official server is `mcp-clickhouse`. The config points it at `reader`:
 
 ```json
 {
@@ -49,10 +49,10 @@ services:
 }
 ```
 
-Дальше агент видит `logs.logs` и системные таблицы и гоняет SQL из
-`clickhouse/queries.sql` (топ ошибок, динамика по уровням, поиск по `message`/`context`).
+From there the agent sees `logs.logs` and the system tables and runs the SQL from
+`clickhouse/queries.sql` (top errors, level breakdown over time, search by `message`/`context`).
 
-## Прямой SQL без MCP
+## Direct SQL without MCP
 
 ```bash
 curl -s 'http://127.0.0.1:8123/' \
@@ -61,8 +61,8 @@ curl -s 'http://127.0.0.1:8123/' \
                  WHERE timestamp > now()-INTERVAL 1 HOUR GROUP BY project FORMAT JSON"
 ```
 
-## Безопасность
+## Security
 
-- `reader` — только `SELECT` + readonly-режим (нельзя менять настройки/обходить лимиты).
-- НЕ публикуйте 8123 в публичную сеть — loopback-биндинг (A) или внутренняя сеть (B).
-- Для удалённого агента ставьте TLS-прокси перед ClickHouse.
+- `reader` — `SELECT` only + readonly mode (cannot change settings/bypass limits).
+- Do NOT publish 8123 to a public network — use loopback binding (A) or the internal network (B).
+- For a remote agent, put a TLS proxy in front of ClickHouse.

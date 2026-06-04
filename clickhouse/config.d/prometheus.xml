@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <!--
-  Встроенный Prometheus-эндпоинт ClickHouse на порту 9363 (наружу НЕ публикуется).
-  Даёт ProfileEvents_*, CurrentMetrics_*, ClickHouseAsyncMetrics_* без отдельного
-  exporter'а (важно для 1 ГБ-бокса). Scrape изнутри docker-сети.
+  ClickHouse built-in Prometheus endpoint on port 9363 (NOT published externally).
+  Exposes ProfileEvents_*, CurrentMetrics_*, ClickHouseAsyncMetrics_* without a
+  separate exporter (important on a 1 GB box). Scrape from within the docker network.
 -->
 <clickhouse>
     <prometheus>

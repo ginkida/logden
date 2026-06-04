@@ -1,27 +1,27 @@
 <?xml version="1.0"?>
 <!--
-  Тюнинг ClickHouse под 1 ГБ-бокс (оставляем место под шлюз и ОС).
-  Положить в: /etc/clickhouse-server/config.d/low-mem.xml
+  Tuning ClickHouse for a 1 GB box (leaving room for the gateway and the OS).
+  Place in: /etc/clickhouse-server/config.d/low-mem.xml
 -->
 <clickhouse>
-    <!-- Жёсткий потолок памяти на весь сервер: 768 МБ -->
+    <!-- Hard memory ceiling for the whole server: 768 MB -->
     <max_server_memory_usage>805306368</max_server_memory_usage>
 
-    <!-- Кэш засечек: 256 МБ вместо дефолтных 5 ГБ -->
+    <!-- Mark cache: 256 MB instead of the default 5 GB -->
     <mark_cache_size>268435456</mark_cache_size>
 
-    <!-- Кэш распакованных блоков выключен -->
+    <!-- Uncompressed block cache disabled -->
     <uncompressed_cache_size>0</uncompressed_cache_size>
 
-    <!-- Ограничиваем пиковую память фоновых мерджей (безопасно, не ломает старт) -->
+    <!-- Cap peak memory of background merges (safe, does not break startup) -->
     <merge_tree>
         <max_bytes_to_merge_at_max_space_in_pool>1073741824</max_bytes_to_merge_at_max_space_in_pool>
         <merge_max_block_size>2048</merge_max_block_size>
     </merge_tree>
 
-    <!-- listen_host не задаём:
-         - bare metal: ClickHouse по умолчанию слушает только localhost;
-         - docker: официальный образ уже слушает все интерфейсы, порт наружу не публикуется.
-         background_pool_size тоже не трогаем: занижение ломает старт
-         (нужно background_pool_size * concurrency_ratio >= 20). -->
+    <!-- listen_host is left unset:
+         - bare metal: ClickHouse listens on localhost only by default;
+         - docker: the official image already listens on all interfaces, and the port is not published externally.
+         background_pool_size is left untouched too: lowering it breaks startup
+         (it requires background_pool_size * concurrency_ratio >= 20). -->
 </clickhouse>

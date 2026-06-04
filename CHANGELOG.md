@@ -1,60 +1,60 @@
 # Changelog
 
-Формат — [Keep a Changelog](https://keepachangelog.com/), версии — [SemVer](https://semver.org/).
+Format — [Keep a Changelog](https://keepachangelog.com/), versioning — [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
 ## [0.2.0] — 2026-06-04
 
 ### Added
-- Конвейер приёма в шлюзе: ограниченный буфер, батчинг, ретраи с backoff,
-  дисковый спул и автоматический реплей (durability при простое ClickHouse).
-- Batch-приём: JSON-массив, NDJSON, gzip-тело; приём клиентского `timestamp`.
-- Валидация: whitelist/нормализация `level`, проверка `project`, лимиты
-  message/context/тела/числа событий.
-- Наблюдаемость: Prometheus `/metrics`, readiness `/readyz`, `/version`,
-  structured logging (slog/JSON). Встроенный prometheus-эндпоинт ClickHouse (:9363).
-- Безопасность: несколько токенов (ротация), rate limiting, `TRUSTED_PROXIES`
-  для X-Forwarded-For, секреты из файлов (`*_FILE`), hardening контейнеров
-  (read_only, cap_drop, no-new-privileges), default ClickHouse ограничен loopback.
-- ClickHouse prod-конфиг: `ttl_only_drop_parts`, tokenbf skip-индексы,
-  TTL системных логов, тюнинг async_insert, профиль/квоты для `reader`,
-  нативный BACKUP-диск.
-- Эксплуатация: graceful shutdown, healthcheck-режим бинаря, Makefile,
-  RUNBOOK/SECURITY/CONTRIBUTING, релизный workflow (GHCR multi-arch + SBOM/provenance),
-  пин образов по digest, лимиты ресурсов и ротация логов в compose.
-- Fail-fast валидация конфигурации шлюза на старте (понятные ошибки вместо паники под нагрузкой).
-- Prometheus alert-rules (`deploy/alerts.yml`) и метрика `logden_buffer_capacity` (для алерта на заполнение буфера).
-- Хардненинг CI: hadolint, shellcheck, yamllint (`--strict`), promtool check rules; Dependabot (gomod/actions/docker).
-- Переиспользуемые клиенты с батчингом в `clients/` (Go-пакет + тест, Python, Node) — без внешних зависимостей.
-- Опциональная авторизация `/metrics` через `METRICS_TOKEN`.
-- Доки по доступу агента/MCP к ClickHouse (`docs/agent-access.md`) + пример loopback-оверрайда compose.
-- Нагрузочный генератор `tools/loadtest` (+ `make loadtest`) для проверки throughput.
-- Тесты: юнит (auth, валидация, батч, спул/реплей, clientIP, метрики, конфиг) + интеграция с ClickHouse.
-- Карантин спула: батч, отвергнутый ClickHouse (HTTP 400 — например, после несовместимой
-  миграции), переименовывается в `*.ndjson.bad` и не блокирует реплей остальной очереди;
-  новая метрика `logden_spool_quarantined_total` (события учитываются и в `dropped`).
-- Фоновая проба ClickHouse: `logden_clickhouse_reachable` обновляется и без внешних
-  запросов к `/readyz` — алерт `LogdenClickHouseUnreachable` работает из коробки.
-- Warning при старте, если `METRICS_TOKEN` пуст (открытый `/metrics`).
-- `GATEWAY_IMAGE` в compose: запуск готового образа из ghcr без локальной сборки.
-- Безопасные дефолты: порт шлюза в compose биндится на 127.0.0.1 (`GATEWAY_BIND`
-  для переопределения); CI-workflow с минимальными `permissions: contents: read`.
+- Ingest pipeline in the gateway: bounded buffer, batching, retries with backoff,
+  disk spool and automatic replay (durability while ClickHouse is down).
+- Batch ingest: JSON array, NDJSON, gzip body; accepts a client-supplied `timestamp`.
+- Validation: `level` whitelist/normalization, `project` check, limits on
+  message/context/body/event count.
+- Observability: Prometheus `/metrics`, readiness `/readyz`, `/version`,
+  structured logging (slog/JSON). Built-in ClickHouse prometheus endpoint (:9363).
+- Security: multiple tokens (rotation), rate limiting, `TRUSTED_PROXIES`
+  for X-Forwarded-For, secrets from files (`*_FILE`), container hardening
+  (read_only, cap_drop, no-new-privileges), default ClickHouse restricted to loopback.
+- ClickHouse prod config: `ttl_only_drop_parts`, tokenbf skip indexes,
+  TTL for system logs, async_insert tuning, profile/quotas for `reader`,
+  native BACKUP disk.
+- Operations: graceful shutdown, healthcheck mode for the binary, Makefile,
+  RUNBOOK/SECURITY/CONTRIBUTING, release workflow (GHCR multi-arch + SBOM/provenance),
+  images pinned by digest, resource limits and log rotation in compose.
+- Fail-fast validation of the gateway config at startup (clear errors instead of a panic under load).
+- Prometheus alert rules (`deploy/alerts.yml`) and the `logden_buffer_capacity` metric (for a buffer-fill alert).
+- CI hardening: hadolint, shellcheck, yamllint (`--strict`), promtool check rules; Dependabot (gomod/actions/docker).
+- Reusable batching clients in `clients/` (Go package + test, Python, Node) — no external dependencies.
+- Optional `/metrics` authorization via `METRICS_TOKEN`.
+- Docs on agent/MCP access to ClickHouse (`docs/agent-access.md`) + an example loopback compose override.
+- Load generator `tools/loadtest` (+ `make loadtest`) for throughput testing.
+- Tests: unit (auth, validation, batch, spool/replay, clientIP, metrics, config) + ClickHouse integration.
+- Spool quarantine: a batch rejected by ClickHouse (HTTP 400 — e.g. after an incompatible
+  migration) is renamed to `*.ndjson.bad` and does not block replay of the rest of the queue;
+  new `logden_spool_quarantined_total` metric (events are also counted in `dropped`).
+- Background ClickHouse probe: `logden_clickhouse_reachable` updates even without external
+  `/readyz` requests — the `LogdenClickHouseUnreachable` alert works out of the box.
+- Startup warning when `METRICS_TOKEN` is empty (open `/metrics`).
+- `GATEWAY_IMAGE` in compose: run a prebuilt image from ghcr without a local build.
+- Safe defaults: the gateway port in compose binds to 127.0.0.1 (`GATEWAY_BIND`
+  to override); CI workflow with minimal `permissions: contents: read`.
 
 ### Fixed
-- Shutdown: устранена паника `send on closed channel` (канал закрывается синхронно с enqueue) и неограниченный дренаж (реплей спула прерывается сигналом остановки).
-- NDJSON с синтаксически битой строкой теперь отдаёт `400` (наблюдаемо), а не теряет валидный хвост молча.
-- Клиенты: Node fire-and-forget больше не даёт unhandledRejection; Go `Close()` идемпотентен; Python `close()` джойнит фоновый флашер.
-- `Authorization: Bearer` принимается регистронезависимо (RFC 7235).
-- Исправлен staticcheck SA4000 в тесте rate limiter.
-- Спул: осиротевшие `*.tmp` (крэш между записью и rename) удаляются при старте.
-- Python-клиент: фоновый флашер переживает ошибки отправки (раньше первая сетевая
-  ошибка навсегда убивала поток); batch-режим — fire-and-forget, как в Node.
-- CI/Release: все GitHub Actions запинены по commit SHA, `prom/prometheus` — по digest.
-- Доки: bare-metal установка требует `clickhouse-access.xml` (access_management) до
-  `users.sql`; рабочая процедура RESTORE (через временную таблицу + EXCHANGE);
-  явная оговорка, что клиенты не ретраят.
+- Shutdown: fixed the `send on closed channel` panic (the channel is closed synchronously with enqueue) and unbounded drain (spool replay is interrupted by the stop signal).
+- NDJSON with a syntactically broken line now returns `400` (observable) instead of silently dropping the valid tail.
+- Clients: Node fire-and-forget no longer causes unhandledRejection; Go `Close()` is idempotent; Python `close()` joins the background flusher.
+- `Authorization: Bearer` is accepted case-insensitively (RFC 7235).
+- Fixed staticcheck SA4000 in the rate limiter test.
+- Spool: orphaned `*.tmp` files (a crash between write and rename) are removed at startup.
+- Python client: the background flusher survives send errors (previously the first network
+  error killed the thread for good); batch mode is fire-and-forget, like Node.
+- CI/Release: all GitHub Actions are pinned by commit SHA, `prom/prometheus` — by digest.
+- Docs: bare-metal install requires `clickhouse-access.xml` (access_management) before
+  `users.sql`; a working RESTORE procedure (via a temp table + EXCHANGE);
+  an explicit note that clients do not retry.
 
 ## [0.1.0]
-- Базовая версия: тонкий шлюз (`POST /logs`, общий токен, single insert),
-  схема ClickHouse с TTL 30 дней, docker-compose, init-схема/пользователи.
+- Initial version: thin gateway (`POST /logs`, shared token, single insert),
+  ClickHouse schema with 30-day TTL, docker-compose, init schema/users.

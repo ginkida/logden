@@ -12,9 +12,9 @@ import (
 	"time"
 )
 
-// row — одна строка в формате колонок таблицy logs.logs (JSONEachRow).
-// Context хранится JSON-строкой; Timestamp опускается, если клиент не прислал
-// валидное время — тогда ClickHouse подставит DEFAULT now64(3).
+// row is one row in the column format of the logs.logs table (JSONEachRow).
+// Context is stored as a JSON string; Timestamp is omitted when the client
+// didn't send a valid time — then ClickHouse fills in DEFAULT now64(3).
 type row struct {
 	Timestamp string `json:"timestamp,omitempty"`
 	Project   string `json:"project"`
@@ -38,13 +38,13 @@ var levelAliases = map[string]string{
 	"warn": "warning", "err": "error", "fatal": "critical", "panic": "emergency", "trace": "debug",
 }
 
-// PSR-3 / syslog severities — совпадает с уровнями в queries.sql.
+// PSR-3 / syslog severities — matches the levels in queries.sql.
 var allowedLevels = map[string]bool{
 	"debug": true, "info": true, "notice": true, "warning": true,
 	"error": true, "critical": true, "alert": true, "emergency": true,
 }
 
-// readBody распаковывает gzip (с защитой от gzip-bomb) и ограничивает размер.
+// readBody decompresses gzip (with gzip-bomb protection) and caps the size.
 func (s *server) readBody(r *http.Request) ([]byte, int, string) {
 	limit := s.cfg.maxBodyBytes
 	var src io.Reader = io.LimitReader(r.Body, limit+1)
@@ -54,7 +54,7 @@ func (s *server) readBody(r *http.Request) ([]byte, int, string) {
 			return nil, http.StatusBadRequest, "bad_gzip"
 		}
 		defer gz.Close()
-		src = io.LimitReader(gz, limit+1) // ограничиваем РАСПАКОВАННЫЙ объём
+		src = io.LimitReader(gz, limit+1) // cap the DECOMPRESSED size
 	}
 	data, err := io.ReadAll(src)
 	if err != nil {
@@ -66,7 +66,7 @@ func (s *server) readBody(r *http.Request) ([]byte, int, string) {
 	return data, 0, ""
 }
 
-// parseBatch принимает один объект, JSON-массив или NDJSON и возвращает строки.
+// parseBatch accepts a single object, a JSON array or NDJSON and returns rows.
 func (s *server) parseBatch(r *http.Request) ([]row, int, string) {
 	data, code, reason := s.readBody(r)
 	if code != 0 {
@@ -83,8 +83,8 @@ func (s *server) parseBatch(r *http.Request) ([]row, int, string) {
 			return nil, http.StatusBadRequest, "bad_json"
 		}
 	} else {
-		// Один объект или NDJSON: декодер читает последовательность JSON-значений,
-		// разделённых пробелами/переводами строк.
+		// Single object or NDJSON: the decoder reads a sequence of JSON values
+		// separated by spaces/newlines.
 		dec := json.NewDecoder(bytes.NewReader(trimmed))
 		for {
 			var raw json.RawMessage
@@ -93,9 +93,9 @@ func (s *server) parseBatch(r *http.Request) ([]row, int, string) {
 				break
 			}
 			if err != nil {
-				// Синтаксически битый ввод => 400 (наблюдаемо), а не тихая потеря
-				// хвоста после break. Семантически невалидные (но валидный JSON)
-				// элементы пропускаются поэлементно ниже.
+				// Syntactically broken input => 400 (observable), not a silent
+				// loss of the tail after break. Semantically invalid (but valid
+				// JSON) elements are skipped per-element below.
 				return nil, http.StatusBadRequest, "bad_json"
 			}
 			raws = append(raws, raw)
@@ -112,8 +112,9 @@ func (s *server) parseBatch(r *http.Request) ([]row, int, string) {
 		return nil, http.StatusRequestEntityTooLarge, "too_many_events"
 	}
 
-	// Частичный приём: один битый элемент не должен ронять весь батч (иначе одна
-	// плохая строка теряет тысячи хороших, а ретрай повторяет ту же ошибку).
+	// Partial accept: one broken element must not drop the whole batch (otherwise
+	// a single bad line loses thousands of good ones, and the retry repeats the
+	// same error).
 	rows := make([]row, 0, len(raws))
 	for _, raw := range raws {
 		var e inEvent
@@ -150,7 +151,7 @@ func (s *server) buildRow(e inEvent) (row, bool) {
 		} else {
 			msg = strings.ToValidUTF8(msg[:s.cfg.maxMessageBytes-len(suffix)], "") + suffix
 		}
-		// итог всегда <= maxMessageBytes
+		// the result is always <= maxMessageBytes
 	}
 	return row{
 		Timestamp: normalizeTimestamp(e.Timestamp, s.cfg.retention),
@@ -189,9 +190,9 @@ func normalizeContext(raw json.RawMessage, max int) string {
 	return string(t)
 }
 
-// normalizeTimestamp принимает RFC3339 или unix (сек/мс). Возвращает время в
-// формате ClickHouse или "" (тогда CH поставит время вставки). Защита от
-// мусора: будущее >+5мин и старше ретеншна отбрасываются.
+// normalizeTimestamp accepts RFC3339 or unix (sec/ms). Returns the time in
+// ClickHouse format, or "" (then CH stamps the insert time). Junk protection:
+// anything more than +5min in the future or older than the retention is dropped.
 func normalizeTimestamp(raw json.RawMessage, retention time.Duration) string {
 	raw = bytes.TrimSpace(raw)
 	if len(raw) == 0 || string(raw) == "null" {
@@ -217,7 +218,7 @@ func normalizeTimestamp(raw json.RawMessage, retention time.Duration) string {
 			t = time.UnixMilli(int64(f))
 		} else {
 			sec := int64(f)
-			t = time.Unix(sec, int64((f-float64(sec))*1e9)) // сохраняем дробные секунды
+			t = time.Unix(sec, int64((f-float64(sec))*1e9)) // keep fractional seconds
 		}
 	}
 	t = t.UTC()

@@ -38,7 +38,7 @@ func TestRateLimitedEndpoint(t *testing.T) {
 
 func TestGzipBomb(t *testing.T) {
 	cfg := testConfig()
-	cfg.maxBodyBytes = 100 // маленький лимит распакованного тела
+	cfg.maxBodyBytes = 100 // small limit on the decompressed body
 	s := newServer(cfg)
 
 	var buf bytes.Buffer
@@ -121,7 +121,7 @@ func TestMetricsAuth(t *testing.T) {
 		t.Fatalf("correct token: want 200 got %d", rr2.Code)
 	}
 
-	// без METRICS_TOKEN — открыто
+	// without METRICS_TOKEN — open
 	open := newServer(testConfig())
 	rr3 := httptest.NewRecorder()
 	open.mux().ServeHTTP(rr3, httptest.NewRequest("GET", "/metrics", nil))
@@ -134,8 +134,8 @@ func TestEnqueueAfterStop(t *testing.T) {
 	s := newServer(testConfig())
 	s.ingest.start()
 	s.ingest.stop()
-	// enqueue после stop() не должен паниковать (send on closed channel) и обязан
-	// корректно отбросить событие.
+	// enqueue after stop() must not panic (send on closed channel) and must
+	// drop the event cleanly.
 	acc, drop := s.ingest.enqueue([]row{{Project: "p", Message: "x"}}, "1.2.3.4")
 	if acc != 0 || drop != 1 {
 		t.Fatalf("after stop want accepted=0 dropped=1, got %d/%d", acc, drop)
@@ -143,7 +143,7 @@ func TestEnqueueAfterStop(t *testing.T) {
 }
 
 func TestClientIPNoTrustedProxies(t *testing.T) {
-	s := newServer(testConfig()) // trustedProxies пуст
+	s := newServer(testConfig()) // trustedProxies is empty
 	req := httptest.NewRequest("POST", "/logs", nil)
 	req.RemoteAddr = "203.0.113.7:9999"
 	req.Header.Set("X-Forwarded-For", "1.2.3.4")

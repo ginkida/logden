@@ -10,15 +10,15 @@ ExecStart=/usr/local/bin/logden
 Restart=always
 RestartSec=2
 
-# ресурсы (на 1 ГБ-боксе не конкурируем с ClickHouse)
+# resources (don't compete with ClickHouse on a 1 GB box)
 MemoryMax=64M
 MemoryHigh=48M
 CPUQuota=50%
 
-# спул переживает рестарты: каталог создаётся systemd под dynamic-юзером
+# spool survives restarts: systemd creates the directory under the dynamic user
 StateDirectory=logden
 
-# изоляция / sandbox
+# isolation / sandbox
 DynamicUser=yes
 NoNewPrivileges=yes
 ProtectSystem=strict

@@ -6,8 +6,8 @@ import (
 	"strings"
 )
 
-// validate проверяет инварианты конфигурации на старте, чтобы упасть сразу с
-// понятной ошибкой, а не словить панику тикера/слайса под нагрузкой.
+// validate checks configuration invariants at startup so we fail fast with a
+// clear error instead of hitting a ticker/slice panic under load.
 func (c config) validate() error {
 	var errs []string
 	add := func(cond bool, msg string) {
@@ -23,7 +23,7 @@ func (c config) validate() error {
 	add(c.replayInterval <= 0, "REPLAY_INTERVAL must be > 0")
 	add(c.maxRetries < 0, "MAX_RETRIES must be >= 0")
 	add(c.maxBodyBytes <= 0, "MAX_BODY_BYTES must be > 0")
-	// >= 16, чтобы суффикс усечения помещался и инвариант len<=limit держался.
+	// >= 16 so the truncation suffix fits and the len<=limit invariant holds.
 	add(c.maxMessageBytes < 16, "MAX_MESSAGE_BYTES must be >= 16")
 	add(c.maxContextBytes <= 0, "MAX_CONTEXT_BYTES must be > 0")
 	add(c.maxBatchEvents <= 0, "MAX_BATCH_EVENTS must be > 0")

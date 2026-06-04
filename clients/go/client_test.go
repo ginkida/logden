@@ -25,7 +25,7 @@ func TestClientSendAndBatch(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// без батчинга — отправка сразу
+	// no batching — sent immediately
 	c := New(srv.URL, "tok", "proj")
 	if err := c.Error("boom", map[string]any{"x": 1}); err != nil {
 		t.Fatalf("send: %v", err)
@@ -37,25 +37,25 @@ func TestClientSendAndBatch(t *testing.T) {
 		t.Fatal("Authorization header not propagated")
 	}
 
-	// батчинг по размеру
+	// batching by size
 	bc := New(srv.URL, "tok", "proj", WithBatch(3, time.Hour))
 	_ = bc.Info("a", nil)
 	_ = bc.Info("b", nil)
 	if total.Load() != 1 {
 		t.Fatalf("should not flush before reaching batch size, got %d", total.Load())
 	}
-	_ = bc.Info("c", nil) // достигли 3 -> флаш
+	_ = bc.Info("c", nil) // reached 3 -> flush
 	if total.Load() != 4 {
 		t.Fatalf("batch flush: want 4 got %d", total.Load())
 	}
 	_ = bc.Warn("d", nil)
-	if err := bc.Close(); err != nil { // дослать остаток
+	if err := bc.Close(); err != nil { // send the remainder
 		t.Fatalf("close: %v", err)
 	}
 	if total.Load() != 5 {
 		t.Fatalf("close flush: want 5 got %d", total.Load())
 	}
-	if err := bc.Close(); err != nil { // повторный Close должен быть безопасен
+	if err := bc.Close(); err != nil { // a second Close must be safe
 		t.Fatalf("second close: %v", err)
 	}
 }

@@ -2,44 +2,44 @@ GATEWAY := gateway
 
 .PHONY: build test vet fmt lint run up down logs ps smoke clean help
 
-help: ## показать список целей
+help: ## show the list of targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  %-10s %s\n", $$1, $$2}'
 
-build: ## собрать бинарь шлюза
+build: ## build the gateway binary
 	cd $(GATEWAY) && CGO_ENABLED=0 go build -ldflags='-s -w' -o logden .
 
-test: ## юнит-тесты с race-детектором
+test: ## unit tests with the race detector
 	cd $(GATEWAY) && go test -race ./...
 
 vet: ## go vet
 	cd $(GATEWAY) && go vet ./...
 
-fmt: ## форматирование
+fmt: ## formatting
 	cd $(GATEWAY) && gofmt -w .
 
 lint: ## vet + staticcheck
 	cd $(GATEWAY) && go vet ./... && go run honnef.co/go/tools/cmd/staticcheck@latest ./...
 
-run: ## локальный запуск шлюза (нужен ClickHouse и LOG_TOKEN)
+run: ## run the gateway locally (needs ClickHouse and LOG_TOKEN)
 	cd $(GATEWAY) && go run .
 
-up: ## поднять стек в docker
+up: ## bring the stack up in docker
 	docker compose up -d --build
 
-down: ## остановить стек
+down: ## stop the stack
 	docker compose down
 
-logs: ## логи стека
+logs: ## stack logs
 	docker compose logs -f --tail=100
 
-ps: ## статус контейнеров
+ps: ## container status
 	docker compose ps
 
-smoke: ## отправить тестовый лог
+smoke: ## send a test log
 	LOG_TOKEN=$${LOG_TOKEN:-test_shared_token_change_me} bash examples/curl.sh
 
-loadtest: ## нагрузочный тест (нужен поднятый стек + LOG_TOKEN)
+loadtest: ## load test (needs a running stack + LOG_TOKEN)
 	cd tools/loadtest && go run . -token $${LOG_TOKEN:?set LOG_TOKEN}
 
-clean: ## убрать артефакты сборки
+clean: ## remove build artifacts
 	rm -f $(GATEWAY)/logden $(GATEWAY)/coverage.out

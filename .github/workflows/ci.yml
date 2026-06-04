@@ -44,8 +44,8 @@ jobs:
     services:
       clickhouse:
         image: clickhouse/clickhouse-server:24.8@sha256:1ffa82edee000a42c09313bd9f1293d94c570aee74babc1b3ca9983a35fa597b
-        # задаём пароль => entrypoint открывает default для сети (иначе default
-        # ограничен loopback и тест с host получит 403)
+        # set a password => entrypoint opens default to the network (otherwise
+        # default is loopback-only and a test from the host gets a 403)
         env:
           CLICKHOUSE_USER: default
           CLICKHOUSE_PASSWORD: ci

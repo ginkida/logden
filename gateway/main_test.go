@@ -141,7 +141,7 @@ func TestGzip(t *testing.T) {
 		t.Fatalf("gzip valid: want 204 got %d", rr.Code)
 	}
 
-	// невалидный gzip
+	// invalid gzip
 	req2 := httptest.NewRequest("POST", "/logs", strings.NewReader("not gzip"))
 	req2.Header.Set("Authorization", "Bearer secret")
 	req2.Header.Set("Content-Encoding", "gzip")
@@ -155,7 +155,7 @@ func TestGzip(t *testing.T) {
 func TestBufferFull(t *testing.T) {
 	cfg := testConfig()
 	cfg.bufferSize = 1
-	s := newServer(cfg) // воркер не запущен — никто не вычитывает буфер
+	s := newServer(cfg) // worker not started — nobody drains the buffer
 	if rr := doLogs(s, "POST", "secret", `{"project":"p","message":"a"}`, nil); rr.Code != http.StatusNoContent {
 		t.Fatalf("first: want 204 got %d", rr.Code)
 	}
@@ -240,13 +240,13 @@ func TestRetryAndSpoolReplay(t *testing.T) {
 
 	doLogs(s, "POST", "secret", `{"project":"p","message":"x"}`, nil)
 
-	// ClickHouse "лежит": после ретраев батч уходит в спул
+	// ClickHouse is "down": after retries the batch goes to the spool
 	waitFor(t, 4*time.Second, func() bool { return s.m.spoolFiles.Load() >= 1 })
 	if s.m.insertFailed.Load() == 0 {
 		t.Fatal("expected insertFailed > 0")
 	}
 
-	// ClickHouse "поднялся": переигрываем спул
+	// ClickHouse is "back up": replay the spool
 	fail.Store(false)
 	s.ingest.replayOnce()
 	waitFor(t, 4*time.Second, func() bool { return s.m.spoolFiles.Load() == 0 })
@@ -256,8 +256,8 @@ func TestRetryAndSpoolReplay(t *testing.T) {
 }
 
 func TestSpoolQuarantine(t *testing.T) {
-	// Стаб ClickHouse: батчи со словом "poison" отвергает 400 (как при
-	// несовместимости схемы/битом файле), остальные принимает.
+	// ClickHouse stub: batches containing the word "poison" are rejected with 400
+	// (as on a schema mismatch / corrupt file), everything else is accepted.
 	var inserts atomic.Int64
 	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
@@ -275,7 +275,7 @@ func TestSpoolQuarantine(t *testing.T) {
 	cfg.spoolDir = t.TempDir()
 	s := newServer(cfg)
 
-	// Ядовитый файл в голове очереди не должен блокировать валидный за ним.
+	// A poison file at the head of the queue must not block a valid one behind it.
 	poison := filepath.Join(cfg.spoolDir, "1-000000000001.ndjson")
 	valid := filepath.Join(cfg.spoolDir, "1-000000000002.ndjson")
 	if err := os.WriteFile(poison, []byte(`{"message":"poison"}`), 0o640); err != nil {
@@ -380,7 +380,7 @@ func TestNormalizeTimestamp(t *testing.T) {
 	if got := normalizeTimestamp(json.RawMessage(`"2020-01-01T00:00:00Z"`), 365*24*time.Hour*100); got == "" {
 		t.Errorf("valid RFC3339 should parse")
 	}
-	// слишком старое относительно ретеншна — отбрасываем
+	// too old relative to retention — dropped
 	if got := normalizeTimestamp(json.RawMessage(`"2000-01-01T00:00:00Z"`), time.Hour); got != "" {
 		t.Errorf("too old ts must be dropped, got %q", got)
 	}
@@ -397,7 +397,7 @@ func TestSecureEqual(t *testing.T) {
 
 func TestPartialBatch(t *testing.T) {
 	s := newServer(testConfig())
-	// валидный, null (битый), валидный — должны пройти 2 валидных
+	// valid, null (broken), valid — the 2 valid ones should pass
 	rr := doLogs(s, "POST", "secret", `[{"project":"p","message":"a"},null,{"project":"p","message":"b"}]`, nil)
 	if rr.Code != http.StatusNoContent {
 		t.Fatalf("partial batch: want 204 got %d (%s)", rr.Code, rr.Body.String())
@@ -405,7 +405,7 @@ func TestPartialBatch(t *testing.T) {
 	if got := s.m.received.Load(); got != 2 {
 		t.Fatalf("want 2 accepted, got %d", got)
 	}
-	// полностью битый батч -> 400
+	// fully broken batch -> 400
 	if rr2 := doLogs(s, "POST", "secret", `[null,123]`, nil); rr2.Code != http.StatusBadRequest {
 		t.Fatalf("all-invalid batch: want 400 got %d", rr2.Code)
 	}

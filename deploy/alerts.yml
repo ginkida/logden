@@ -1,7 +1,7 @@
-# Prometheus alert rules для logden.
-# Подключение: в prometheus.yml -> rule_files: [ "alerts.yml" ].
-# Метрики шлюза снимаются с :8080/metrics (job=logden), метрики
-# ClickHouse — со встроенного :9363/metrics (job=clickhouse).
+# Prometheus alert rules for logden.
+# Wiring: in prometheus.yml -> rule_files: [ "alerts.yml" ].
+# Gateway metrics are scraped from :8080/metrics (job=logden), ClickHouse
+# metrics from its built-in :9363/metrics (job=clickhouse).
 groups:
   - name: logden
     rules:
@@ -11,55 +11,55 @@ groups:
         labels: { severity: critical }
         annotations:
           summary: "logden target down"
-          description: "Шлюз не отвечает на scrape > 2m."
+          description: "Gateway not answering scrapes for > 2m."
 
       - alert: LogdenClickHouseUnreachable
         expr: logden_clickhouse_reachable == 0
         for: 2m
         labels: { severity: critical }
         annotations:
-          summary: "ClickHouse недоступен из шлюза"
-          description: "logden_clickhouse_reachable=0 > 2m — приём логов под угрозой."
+          summary: "ClickHouse unreachable from gateway"
+          description: "logden_clickhouse_reachable=0 for > 2m — log ingest at risk."
 
       - alert: LogdenLogsDropped
         expr: increase(logden_logs_dropped_total[5m]) > 0
         for: 0m
         labels: { severity: critical }
         annotations:
-          summary: "Логи теряются"
-          description: "logden_logs_dropped_total растёт — переполнены буфер и спул."
+          summary: "Logs being dropped"
+          description: "logden_logs_dropped_total is rising — buffer and spool are full."
 
       - alert: LogdenInsertFailing
         expr: increase(logden_clickhouse_insert_failed_total[5m]) > 0
         for: 5m
         labels: { severity: warning }
         annotations:
-          summary: "Вставки в ClickHouse падают"
-          description: "Батчи уходят в спул; проверьте ClickHouse."
+          summary: "ClickHouse inserts failing"
+          description: "Batches are going to the spool; check ClickHouse."
 
       - alert: LogdenSpoolBacklog
         expr: logden_spool_files > 50
         for: 10m
         labels: { severity: warning }
         annotations:
-          summary: "Спул растёт (>50 файлов 10m)"
-          description: "ClickHouse, вероятно, долго недоступен — реплей не успевает."
+          summary: "Spool growing (>50 files for 10m)"
+          description: "ClickHouse is likely down for a while — replay can't keep up."
 
       - alert: LogdenBufferNearFull
         expr: logden_buffer_events / logden_buffer_capacity > 0.8
         for: 5m
         labels: { severity: warning }
         annotations:
-          summary: "Буфер шлюза >80%"
-          description: "Backpressure: воркер не успевает флашить в ClickHouse."
+          summary: "Gateway buffer >80%"
+          description: "Backpressure: the worker can't flush to ClickHouse fast enough."
 
       - alert: LogdenInsertLatencyHigh
         expr: histogram_quantile(0.99, sum(rate(logden_clickhouse_insert_duration_seconds_bucket[5m])) by (le)) > 2
         for: 10m
         labels: { severity: warning }
         annotations:
-          summary: "p99 латентность вставки > 2s"
-          description: "ClickHouse медленно принимает батчи."
+          summary: "Insert p99 latency > 2s"
+          description: "ClickHouse is slow to accept batches."
 
   - name: clickhouse
     rules:
@@ -68,5 +68,5 @@ groups:
         for: 10m
         labels: { severity: warning }
         annotations:
-          summary: "ClickHouse RSS у потолка"
-          description: "RSS близко к max_server_memory_usage (768МБ) — риск OOM на 1ГБ-боксе."
+          summary: "ClickHouse RSS near the cap"
+          description: "RSS close to max_server_memory_usage (768MB) — OOM risk on a 1GB box."

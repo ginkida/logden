@@ -49,8 +49,8 @@ func envDur(k string, def time.Duration) time.Duration {
 
 func itoa(n int) string { return strconv.Itoa(n) }
 
-// readSecret поддерживает паттерн *_FILE (docker/compose secrets):
-// если задан NAME_FILE — читаем секрет из файла, иначе из NAME.
+// readSecret supports the *_FILE pattern (docker/compose secrets):
+// if NAME_FILE is set, read the secret from the file, otherwise from NAME.
 func readSecret(name string) string {
 	if path := os.Getenv(name + "_FILE"); path != "" {
 		b, err := os.ReadFile(path)
@@ -76,7 +76,7 @@ func splitTokens(s string) []string {
 }
 
 func bearer(r *http.Request) string {
-	// Схема Authorization регистронезависима (RFC 7235).
+	// The Authorization scheme is case-insensitive (RFC 7235).
 	if h := r.Header.Get("Authorization"); len(h) >= 7 && strings.EqualFold(h[:7], "Bearer ") {
 		return strings.TrimSpace(h[7:])
 	}
@@ -139,7 +139,7 @@ func parseLevel(s string) slog.Level {
 	}
 }
 
-// rateLimiter — простой токен-бакет на stdlib (без golang.org/x/time/rate).
+// rateLimiter is a simple token bucket on the stdlib (no golang.org/x/time/rate).
 type rateLimiter struct {
 	mu     sync.Mutex
 	tokens float64

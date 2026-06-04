@@ -1,101 +1,101 @@
 # logden
 
-Компактная система централизованного логирования для нескольких проектов.
-Любой сервис шлёт лог одним HTTP-POST → крошечный Go-шлюз батчит и пишет в
-ClickHouse → анализ обычным SQL. Рассчитано на VPS ~1 ГБ RAM, минимум
-зависимостей (шлюз — только Go stdlib).
+A compact centralized logging system for multiple projects.
+Any service ships a log with a single HTTP POST → a tiny Go gateway batches and
+writes to ClickHouse → analyze with plain SQL. Built for a ~1 GB RAM VPS, with
+minimal dependencies (the gateway uses only the Go stdlib).
 
 [![CI](https://github.com/ginkida/logden/actions/workflows/ci.yml/badge.svg)](https://github.com/ginkida/logden/actions/workflows/ci.yml)
 
-## Возможности
+## Features
 
-- **Простой универсальный API** — `POST /logs` с общим токеном; один объект,
-  JSON-массив, NDJSON или gzip. Пишет кто угодно: Laravel, Node, Python, cron, bash.
-- **Надёжность (на стороне шлюза)** — батчинг, ретраи с backoff, дисковый спул
-  и автоматический реплей: логи переживают кратковременное падение и рестарт
-  ClickHouse. Клиенты при этом намеренно тонкие и не ретраят (см. `clients/`).
-- **Наблюдаемость** — Prometheus `/metrics`, readiness `/readyz`, `/version`,
+- **Simple universal API** — `POST /logs` with a shared token; a single object,
+  a JSON array, NDJSON, or gzip. Anything can write: Laravel, Node, Python, cron, bash.
+- **Reliability (on the gateway side)** — batching, retries with backoff, a disk spool,
+  and automatic replay: logs survive a brief outage and restart of
+  ClickHouse. Clients, meanwhile, are deliberately thin and do not retry (see `clients/`).
+- **Observability** — Prometheus `/metrics`, readiness `/readyz`, `/version`,
   structured logging (slog/JSON).
-- **Компактность** — шлюз ~10-15 МБ RAM, ClickHouse затюнен под 768 МБ; сжатие
-  логов 10-30×, авто-ретеншн партициями.
-- **Безопасность** — общий токен (с ротацией), rate limiting, валидация ввода,
-  read-only/cap-drop контейнер, ClickHouse наружу не торчит.
+- **Compactness** — the gateway uses ~10-15 MB RAM, ClickHouse is tuned for 768 MB; logs
+  compress 10-30×, with automatic partition-based retention.
+- **Security** — shared token (with rotation), rate limiting, input validation,
+  read-only/cap-drop container, ClickHouse not exposed externally.
 
-## Архитектура
+## Architecture
 
 ```
-любой сервис (Laravel / Node / Python / cron / bash)
+any service (Laravel / Node / Python / cron / bash)
         │  POST /logs   { project, level, message, context, timestamp? }
-        │  Authorization: Bearer <общий токен>
+        │  Authorization: Bearer <shared token>
         ▼
 ┌──────────────────────────────────────┐
-│   logden (Go, ~10-15 МБ RAM)  │
-│   токен → валидация → буфер → батч     │
-│   ретраи + backoff → дисковый спул     │
-│   /metrics /readyz /version            │
+│   logden (Go, ~10-15 MB RAM)          │
+│   token → validation → buffer → batch │
+│   retries + backoff → disk spool      │
+│   /metrics /readyz /version           │
 └──────────────────┬───────────────────┘
-                   │ батч INSERT (JSONEachRow, wait_for_async_insert)
+                   │ batch INSERT (JSONEachRow, wait_for_async_insert)
                    ▼
             ┌──────────────┐
-            │  ClickHouse  │  таблица logs.logs, TTL 30 дней, cap 768 МБ
+            │  ClickHouse  │  table logs.logs, TTL 30 days, cap 768 MB
             └──────┬───────┘
                    │ SQL, read-only (reader)
                    ▼
-                агент / анализ
+                agent / analysis
 ```
 
-ClickHouse наружу не публикуется; снаружи доступен только порт шлюза.
+ClickHouse is not published externally; only the gateway port is reachable from outside.
 
-## Контракт API
+## API contract
 
 ```
 POST /logs
 Authorization: Bearer <LOG_TOKEN>
 Content-Type: application/json
-Content-Encoding: gzip            (опционально)
+Content-Encoding: gzip            (optional)
 
 {
-  "project":   "billing-api",     // обязательно: [A-Za-z0-9._-], до 64 символов
-  "level":     "error",           // опц.; нормализуется (warn→warning), по умолч. info
-  "message":   "Payment timeout",  // обязательно; усекается при превышении лимита
-  "context":   { "order_id": 123 },// опц.; любой JSON
-  "timestamp": "2026-06-02T10:00:00Z" // опц.; RFC3339 или unix (сек/мс); иначе время вставки
+  "project":   "billing-api",     // required: [A-Za-z0-9._-], up to 64 chars
+  "level":     "error",           // opt.; normalized (warn→warning), defaults to info
+  "message":   "Payment timeout",  // required; truncated if it exceeds the limit
+  "context":   { "order_id": 123 },// opt.; any JSON
+  "timestamp": "2026-06-02T10:00:00Z" // opt.; RFC3339 or unix (sec/ms); otherwise insertion time
 }
 ```
 
-- **Батч:** тело может быть JSON-массивом `[ {...}, {...} ]` или NDJSON (по объекту на строку).
-- **Частичный приём:** невалидные элементы батча пропускаются (метрика
-  `logden_logs_rejected_total{reason="invalid_event"}`), валидные принимаются; весь
-  батч отклоняется (`400`) только если валидных нет.
-- Ответ: `204 No Content`. Ошибки: `400` (валидация), `401` (токен), `413` (размер),
-  `429` (rate limit), `503` (буфер переполнен).
-- Токен можно слать в `Authorization: Bearer <…>` или в заголовке `X-Log-Token: <…>`.
-- `source_ip` проставляет шлюз (см. `TRUSTED_PROXIES`).
+- **Batch:** the body may be a JSON array `[ {...}, {...} ]` or NDJSON (one object per line).
+- **Partial accept:** invalid batch elements are skipped (the
+  `logden_logs_rejected_total{reason="invalid_event"}` metric), valid ones are accepted; the whole
+  batch is rejected (`400`) only if none are valid.
+- Response: `204 No Content`. Errors: `400` (validation), `401` (token), `413` (size),
+  `429` (rate limit), `503` (buffer full).
+- The token can be sent in `Authorization: Bearer <…>` or in the `X-Log-Token: <…>` header.
+- `source_ip` is set by the gateway (see `TRUSTED_PROXIES`).
 
-### Служебные эндпоинты
+### Service endpoints
 
-| Путь        | Назначение                                              |
+| Path        | Purpose                                                 |
 |-------------|---------------------------------------------------------|
-| `/healthz`  | liveness (всегда 200, не трогает ClickHouse)            |
-| `/readyz`   | readiness (200/503 — проверяет доступность ClickHouse)  |
-| `/metrics`  | Prometheus-метрики                                      |
-| `/version`  | версия/коммит/дата сборки                               |
+| `/healthz`  | liveness (always 200, does not touch ClickHouse)        |
+| `/readyz`   | readiness (200/503 — checks ClickHouse availability)    |
+| `/metrics`  | Prometheus metrics                                      |
+| `/version`  | version/commit/build date                               |
 
-## Быстрый старт (Docker)
+## Quick start (Docker)
 
 ```bash
 cp .env.example .env
-# заполните LOG_TOKEN и пароли: openssl rand -hex 32
+# set LOG_TOKEN and passwords: openssl rand -hex 32
 docker compose up -d --build
 ```
 
-Без сборки из исходников — готовый образ из ghcr (публикуется релизным тегом `v*`):
+Without building from source — use the prebuilt image from ghcr (published on release tag `v*`):
 ```bash
-# в .env: GATEWAY_IMAGE=ghcr.io/ginkida/logden:0.2.0
+# in .env: GATEWAY_IMAGE=ghcr.io/ginkida/logden:0.2.0
 docker compose pull gateway && docker compose up -d
 ```
 
-Проверка:
+Check:
 ```bash
 set -a; . ./.env; set +a
 curl -fsS -X POST http://localhost:8080/logs \
@@ -107,35 +107,34 @@ docker compose exec clickhouse clickhouse-client \
   -q "SELECT * FROM logs.logs ORDER BY timestamp DESC LIMIT 5"
 ```
 
-Порт шлюза `:8080` по умолчанию слушает только loopback хоста (`GATEWAY_BIND=127.0.0.1`) —
-наружу выставляйте через reverse-proxy с TLS (см. [SECURITY.md](SECURITY.md)) или
-осознанно `GATEWAY_BIND=0.0.0.0`. ClickHouse наружу не публикуется вовсе. Том
-`ch-data` хранит данные ClickHouse, том `gw-spool` — буфер шлюза на случай простоя.
+The gateway port `:8080` listens on the host loopback only by default (`GATEWAY_BIND=127.0.0.1`) —
+expose it externally through a TLS reverse proxy (see [SECURITY.md](SECURITY.md)) or
+deliberately set `GATEWAY_BIND=0.0.0.0`. ClickHouse is not published externally at all. The
+`ch-data` volume holds ClickHouse data, the `gw-spool` volume — the gateway buffer for outages.
 
-## Установка без Docker (bare metal)
+## Installation without Docker (bare metal)
 
-1. **ClickHouse** — скопировать `clickhouse/config.d/*` и `clickhouse/users.d/*`
-   в `/etc/clickhouse-server/`, а также `docker/clickhouse-access.xml` →
-   `/etc/clickhouse-server/users.d/` (даёт `default` право создавать
-   пользователей для `users.sql` и запирает его на loopback). Перезапустить,
-   затем:
+1. **ClickHouse** — copy `clickhouse/config.d/*` and `clickhouse/users.d/*`
+   into `/etc/clickhouse-server/`, plus `docker/clickhouse-access.xml` →
+   `/etc/clickhouse-server/users.d/` (grants `default` the right to create
+   users for `users.sql` and locks it to loopback). Restart, then:
    ```bash
    clickhouse-client --multiquery < clickhouse/schema.sql
-   # поменяйте пароли в users.sql:
+   # change the passwords in users.sql:
    clickhouse-client --multiquery < clickhouse/users.sql
    ```
-2. **Шлюз** — `make build`, положить бинарь в `/usr/local/bin/`, настроить
-   `deploy/logden.env.example` → `/etc/logden.env`, поставить
-   `deploy/logden.service` и `systemctl enable --now logden`.
+2. **Gateway** — `make build`, put the binary in `/usr/local/bin/`, configure
+   `deploy/logden.env.example` → `/etc/logden.env`, install
+   `deploy/logden.service` and `systemctl enable --now logden`.
 
-## Клиенты
+## Clients
 
-Готовые модули с батчингом — `clients/` (Go-пакет, Python, Node).
+Ready-made modules with batching — `clients/` (Go package, Python, Node).
 **bash** — `examples/curl.sh`. **Laravel** — `examples/LoggerGatewayHandler.php`.
 
-Клиенты намеренно тонкие: **не ретраят и не спулят**; при недоступности шлюза
-событие (в batch-режиме — весь батч, молча) теряется. Вся надёжность доставки —
-на участке шлюз → ClickHouse.
+Clients are deliberately thin: they **do not retry and do not spool**; if the gateway is
+unavailable the event (in batch mode — the whole batch, silently) is lost. All delivery
+reliability lives on the gateway → ClickHouse leg.
 
 **Node.js**
 ```js
@@ -155,88 +154,88 @@ requests.post(f"{os.environ['LOG_GATEWAY_URL']}/logs",
     timeout=2)
 ```
 
-## Конфигурация шлюза (env)
+## Gateway configuration (env)
 
-| Переменная           | По умолчанию             | Описание                                        |
+| Variable             | Default                  | Description                                     |
 |----------------------|--------------------------|-------------------------------------------------|
-| `LOG_TOKEN`          | —                        | общий токен(ы), через запятую; обязателен        |
-| `LISTEN_ADDR`        | `:8080`                  | адрес прослушивания                              |
-| `CLICKHOUSE_URL`     | `http://127.0.0.1:8123`  | адрес ClickHouse                                 |
-| `CLICKHOUSE_USER`    | `writer`                 | пользователь для вставки                         |
-| `CLICKHOUSE_PASSWORD`| —                        | пароль (или `*_FILE`)                            |
-| `BATCH_SIZE`         | `500`                    | размер батча                                     |
-| `BUFFER_SIZE`        | `2000`                   | ёмкость in-memory буфера                         |
-| `FLUSH_INTERVAL`     | `1s`                     | интервал флаша                                   |
-| `MAX_RETRIES`        | `3`                      | ретраи вставки перед спулом                      |
-| `SPOOL_DIR`          | (пусто)                  | каталог дискового спула; пусто = выключен        |
-| `REPLAY_INTERVAL`    | `30s`                    | интервал реплея спула                            |
-| `RATE_LIMIT_RPS`     | `0`                      | лимит запросов/с (0 = выкл.)                      |
-| `RATE_BURST`         | `0` (=`RATE_LIMIT_RPS`)  | размер всплеска токен-бакета                      |
-| `TRUSTED_PROXIES`    | (пусто)                  | CIDR доверенных прокси для `X-Forwarded-For`     |
-| `METRICS_TOKEN`      | (пусто)                  | токен для `/metrics`; пусто = открыто           |
-| `LOG_LEVEL`          | `info`                   | уровень логов шлюза                              |
-| `MAX_MESSAGE_BYTES`  | `65536`                  | потолок размера сообщения                        |
-| `MAX_CONTEXT_BYTES`  | `65536`                  | потолок размера context                          |
-| `MAX_BODY_BYTES`     | `4194304`                | потолок всего тела запроса (источник 413)        |
-| `MAX_BATCH_EVENTS`   | `1000`                   | максимум событий в одном запросе                 |
-| `SPOOL_MAX_FILES`    | `1000`                   | потолок числа батчей в спуле                      |
-| `RETENTION`          | `720h`                   | отбраковка клиентских timestamp старше (≈ TTL)   |
-| `CLICKHOUSE_DB` / `_TABLE` | `logs` / `logs`    | имя базы/таблицы                                 |
+| `LOG_TOKEN`          | —                        | shared token(s), comma-separated; required       |
+| `LISTEN_ADDR`        | `:8080`                  | listen address                                  |
+| `CLICKHOUSE_URL`     | `http://127.0.0.1:8123`  | ClickHouse address                              |
+| `CLICKHOUSE_USER`    | `writer`                 | user for inserts                                |
+| `CLICKHOUSE_PASSWORD`| —                        | password (or `*_FILE`)                          |
+| `BATCH_SIZE`         | `500`                    | batch size                                      |
+| `BUFFER_SIZE`        | `2000`                   | in-memory buffer capacity                       |
+| `FLUSH_INTERVAL`     | `1s`                     | flush interval                                  |
+| `MAX_RETRIES`        | `3`                      | insert retries before spooling                  |
+| `SPOOL_DIR`          | (empty)                  | disk spool directory; empty = disabled          |
+| `REPLAY_INTERVAL`    | `30s`                    | spool replay interval                           |
+| `RATE_LIMIT_RPS`     | `0`                      | request rate limit per second (0 = off)          |
+| `RATE_BURST`         | `0` (=`RATE_LIMIT_RPS`)  | token bucket burst size                          |
+| `TRUSTED_PROXIES`    | (empty)                  | CIDR of trusted proxies for `X-Forwarded-For`   |
+| `METRICS_TOKEN`      | (empty)                  | token for `/metrics`; empty = open              |
+| `LOG_LEVEL`          | `info`                   | gateway log level                               |
+| `MAX_MESSAGE_BYTES`  | `65536`                  | message size cap                                |
+| `MAX_CONTEXT_BYTES`  | `65536`                  | context size cap                                |
+| `MAX_BODY_BYTES`     | `4194304`                | whole request body cap (source of 413)          |
+| `MAX_BATCH_EVENTS`   | `1000`                   | maximum events per request                      |
+| `SPOOL_MAX_FILES`    | `1000`                   | cap on the number of batches in the spool        |
+| `RETENTION`          | `720h`                   | reject client timestamps older than (≈ TTL)     |
+| `CLICKHOUSE_DB` / `_TABLE` | `logs` / `logs`    | database/table name                             |
 
-Источник истины по конфигу — `loadConfig` в `gateway/main.go`.
-Секреты можно подавать файлом: `LOG_TOKEN_FILE`, `CLICKHOUSE_PASSWORD_FILE`.
+The source of truth for config is `loadConfig` in `gateway/main.go`.
+Secrets can be supplied via file: `LOG_TOKEN_FILE`, `CLICKHOUSE_PASSWORD_FILE`.
 
-## Анализ
+## Analysis
 
-Готовые запросы — `clickhouse/queries.sql` (аналитика + мониторинг). Ходить
-read-only пользователем `reader`. Поиск по тексту — через `hasToken(message, …)`
-(использует skip-индекс). Подключение агента/MCP к read-only `reader` —
+Ready-made queries — `clickhouse/queries.sql` (analytics + monitoring). Connect with the
+read-only `reader` user. Full-text search — via `hasToken(message, …)`
+(uses a skip index). Connecting an agent/MCP to the read-only `reader` —
 [docs/agent-access.md](docs/agent-access.md).
 
-## Наблюдаемость
+## Observability
 
-`/metrics` отдаёт (Prometheus): `logden_logs_received_total`,
+`/metrics` exposes (Prometheus): `logden_logs_received_total`,
 `logden_logs_inserted_total`, `logden_logs_dropped_total`,
 `logden_clickhouse_insert_failed_total`, `logden_clickhouse_insert_retries_total`,
 `logden_clickhouse_reachable`, `logden_spool_files`, `logden_buffer_events`,
-`logden_clickhouse_insert_duration_seconds` (гистограмма), `logden_build_info`.
-У ClickHouse включён встроенный prometheus-эндпоинт на `:9363` (наружу не публикуется).
-Готовые alert-rules — `deploy/alerts.yml` (дропы, недоступность CH, рост спула,
-заполнение буфера, латентность вставок, память ClickHouse).
+`logden_clickhouse_insert_duration_seconds` (histogram), `logden_build_info`.
+ClickHouse has its built-in prometheus endpoint enabled on `:9363` (not published externally).
+Ready-made alert rules — `deploy/alerts.yml` (drops, CH unavailability, spool growth,
+buffer fill, insert latency, ClickHouse memory).
 
 ## Production
 
-- **TLS** — токен и логи идут по HTTP; поставьте reverse-proxy (caddy/nginx) с
-  TLS перед шлюзом, а сам шлюз слушайте на loopback. См. [SECURITY.md](SECURITY.md).
-- **Лимиты памяти** — в `docker-compose.yml` заданы `mem_limit` (жёсткий
-  cgroup-потолок поверх мягкого `max_server_memory_usage`). Проверьте под свой бокс.
-- **Эксплуатация** — [RUNBOOK.md](RUNBOOK.md): что делать при падении ClickHouse,
-  ротация токена, смена ретеншна, бэкап, масштабирование.
-- **Версии образов** запинены по digest для воспроизводимости.
-- НЕ публикуйте порты ClickHouse (8123/9000/9363).
+- **TLS** — the token and logs go over HTTP; put a reverse proxy (caddy/nginx) with
+  TLS in front of the gateway, and have the gateway itself listen on loopback. See [SECURITY.md](SECURITY.md).
+- **Memory limits** — `docker-compose.yml` sets `mem_limit` (a hard
+  cgroup cap on top of the soft `max_server_memory_usage`). Check it for your box.
+- **Operations** — [RUNBOOK.md](RUNBOOK.md): what to do when ClickHouse goes down,
+  token rotation, changing retention, backup, scaling.
+- **Image versions** are pinned by digest for reproducibility.
+- DO NOT publish the ClickHouse ports (8123/9000/9363).
 
-## Бюджет RAM (1 ГБ-бокс)
+## RAM budget (1 GB box)
 
-| Компонент        | RAM     |
+| Component        | RAM     |
 |------------------|---------|
-| ClickHouse (cap) | ~768 МБ (cgroup `mem_limit` 850m) |
-| logden   | ~10-15 МБ (`mem_limit` 96m, `GOMEMLIMIT` 80MiB) |
-| ОС + overhead    | ~150 МБ |
+| ClickHouse (cap) | ~768 MB (cgroup `mem_limit` 850m) |
+| logden   | ~10-15 MB (`mem_limit` 96m, `GOMEMLIMIT` 80MiB) |
+| OS + overhead    | ~150 MB |
 
-Замерено в простое: gateway ~2 МБ, ClickHouse ~190 МБ. Память шлюза под нагрузкой ≈
-`BUFFER_SIZE` × средний размер строки; при росте `BUFFER_SIZE` поднимайте `mem_limit`/`GOMEMLIMIT`.
-На 1 ГБ комфортно при дефолтах; для запаса лучше 2 ГБ.
+Measured at idle: gateway ~2 MB, ClickHouse ~190 MB. Gateway memory under load ≈
+`BUFFER_SIZE` × average row size; if you raise `BUFFER_SIZE`, raise `mem_limit`/`GOMEMLIMIT`.
+On 1 GB it is comfortable at defaults; for headroom 2 GB is better.
 
-## Надёжность: что гарантируется
+## Reliability: what is guaranteed
 
-Шлюз отвечает `204` после постановки в буфер, затем батчем пишет в ClickHouse с
-подтверждением (`wait_for_async_insert=1`) и ретраями. При недоступности
-ClickHouse батч уходит в дисковый спул и переигрывается после восстановления —
-логи не теряются на кратком сбое/рестарте базы. Дисковый спул включается через
-`SPOOL_DIR` (в Docker задан по умолчанию); без него durability при простое/shutdown
-не гарантируется. Потеря возможна лишь если переполнены и буфер, и спул (тогда
-`logden_logs_dropped_total` растёт, отдаётся `503`).
+The gateway responds `204` after enqueuing into the buffer, then writes to ClickHouse in a batch with
+acknowledgment (`wait_for_async_insert=1`) and retries. When ClickHouse is unavailable, the batch
+goes to the disk spool and is replayed after recovery —
+logs are not lost on a brief outage/database restart. The disk spool is enabled via
+`SPOOL_DIR` (set by default in Docker); without it, durability during an outage/shutdown
+is not guaranteed. Loss is possible only when both the buffer and the spool are full (then
+`logden_logs_dropped_total` grows and `503` is returned).
 
-## Лицензия
+## License
 
 [MIT](LICENSE).

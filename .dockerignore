@@ -1,4 +1,4 @@
-# Подстраховка на случай сборки из корня (по умолчанию контекст = ./gateway).
+# Safety net in case of building from the root (default context = ./gateway).
 .git
 .github
 .env

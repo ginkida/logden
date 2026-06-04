@@ -1,6 +1,6 @@
-# Локальный оверрайд: открыть ClickHouse HTTP ТОЛЬКО на loopback для агента/MCP.
-# Скопируйте в docker-compose.override.yml (подхватывается автоматически).
-# Наружу порт по-прежнему закрыт — слушает только 127.0.0.1.
+# Local override: expose ClickHouse HTTP on loopback ONLY for the agent/MCP.
+# Copy to docker-compose.override.yml (picked up automatically).
+# The port stays closed externally — it listens on 127.0.0.1 only.
 services:
   clickhouse:
     ports:

@@ -15,22 +15,22 @@ services:
     cpus: "1.5"
     security_opt:
       - "no-new-privileges:true"
-    # cap_drop:[ALL] не выставляем: entrypoint образа делает chown /var/lib/clickhouse
-    # (нужен CAP_CHOWN) и сам дропает привилегии до пользователя clickhouse.
+    # We don't set cap_drop:[ALL]: the image entrypoint chowns /var/lib/clickhouse
+    # (needs CAP_CHOWN) and drops privileges to the clickhouse user itself.
     environment:
       CH_WRITER_PASSWORD: ${CH_WRITER_PASSWORD:?set CH_WRITER_PASSWORD in .env}
       CH_READER_PASSWORD: ${CH_READER_PASSWORD:?set CH_READER_PASSWORD in .env}
     volumes:
       - ch-data:/var/lib/clickhouse
-      # тюнинг памяти, профили, системные логи, prometheus, backup
+      # memory tuning, profiles, system logs, prometheus, backup
       - ./clickhouse/config.d/low-mem.xml:/etc/clickhouse-server/config.d/low-mem.xml:ro
       - ./clickhouse/config.d/system-logs.xml:/etc/clickhouse-server/config.d/system-logs.xml:ro
       - ./clickhouse/config.d/prometheus.xml:/etc/clickhouse-server/config.d/prometheus.xml:ro
       - ./clickhouse/config.d/backup.xml:/etc/clickhouse-server/config.d/backup.xml:ro
       - ./clickhouse/users.d/low-mem.xml:/etc/clickhouse-server/users.d/low-mem.xml:ro
-      # default -> только loopback (для init), доступ управляется
+      # default -> loopback only (for init); access is managed
       - ./docker/clickhouse-access.xml:/etc/clickhouse-server/users.d/access.xml:ro
-      # инициализация при первом старте: схема, затем пользователи из env
+      # first-start init: schema, then users from env
       - ./clickhouse/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
       - ./docker/initdb/20-users.sh:/docker-entrypoint-initdb.d/20-users.sh:ro
     ulimits:
@@ -43,7 +43,7 @@ services:
       timeout: 3s
       retries: 30
       start_period: 10s
-    # Порты 8123/9000/9363 НАРУЖУ НЕ публикуем — доступ только из docker-сети.
+    # Ports 8123/9000/9363 are NOT published externally — access only from the docker network.
 
   gateway:
     build:
@@ -52,11 +52,11 @@ services:
         VERSION: ${VERSION:-dev}
         COMMIT: ${COMMIT:-none}
         BUILD_DATE: ${BUILD_DATE:-unknown}
-    # Готовый образ из ghcr вместо локальной сборки: задайте GATEWAY_IMAGE в .env
-    # и поднимайте через `docker compose pull gateway && docker compose up -d`.
+    # Prebuilt image from ghcr instead of a local build: set GATEWAY_IMAGE in .env
+    # and bring it up with `docker compose pull gateway && docker compose up -d`.
     image: ${GATEWAY_IMAGE:-logden:latest}
     restart: unless-stopped
-    # >= shutdown-бюджет шлюза: shCtx(15s) + ceil(BUFFER_SIZE/BATCH_SIZE)*3s дренажа
+    # >= gateway shutdown budget: shCtx(15s) + ceil(BUFFER_SIZE/BATCH_SIZE)*3s drain
     stop_grace_period: 45s
     logging: *logging
     mem_limit: 96m
@@ -72,7 +72,7 @@ services:
       CLICKHOUSE_USER: writer
       CLICKHOUSE_PASSWORD: ${CH_WRITER_PASSWORD:?set CH_WRITER_PASSWORD in .env}
       LISTEN_ADDR: ":8080"
-      GOMEMLIMIT: 80MiB        # GC-потолок ниже cgroup mem_limit 96m (Go не читает cgroup mem сам)
+      GOMEMLIMIT: 80MiB        # GC ceiling below the cgroup mem_limit 96m (Go doesn't read cgroup mem itself)
       LOG_LEVEL: ${LOG_LEVEL:-info}
       BATCH_SIZE: ${BATCH_SIZE:-500}
       BUFFER_SIZE: ${BUFFER_SIZE:-2000}
@@ -94,8 +94,8 @@ services:
       retries: 3
       start_period: 5s
     ports:
-      # По умолчанию шлюз слушает только loopback хоста: наружу — через
-      # reverse-proxy с TLS (SECURITY.md) или осознанно GATEWAY_BIND=0.0.0.0.
+      # By default the gateway listens on host loopback only: expose it externally
+      # via a TLS reverse-proxy (SECURITY.md) or deliberately with GATEWAY_BIND=0.0.0.0.
       - "${GATEWAY_BIND:-127.0.0.1}:${GATEWAY_PORT:-8080}:8080"
 
 volumes:

@@ -113,8 +113,8 @@ func (s *server) reject(w http.ResponseWriter, path string, code int, reason str
 	http.Error(w, http.StatusText(code), code)
 }
 
-// authorized сверяет предъявленный токен со всеми валидными константно по
-// времени и БЕЗ раннего выхода (поддержка ротации: несколько токенов сразу).
+// authorized compares the presented token against every valid token in
+// constant time and WITHOUT early exit (supports rotation: several tokens at once).
 func (s *server) authorized(r *http.Request) bool {
 	tok := bearer(r)
 	if tok == "" {
@@ -129,8 +129,8 @@ func (s *server) authorized(r *http.Request) bool {
 	return ok
 }
 
-// clientIP доверяет X-Forwarded-For только если соединение пришло от
-// доверенного прокси (TRUSTED_PROXIES); иначе берёт реальный peer.
+// clientIP trusts X-Forwarded-For only when the connection comes from a
+// trusted proxy (TRUSTED_PROXIES); otherwise it uses the real peer.
 func (s *server) clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -156,8 +156,8 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
-// readinessCache кэширует результат пробы ClickHouse, чтобы частые /readyz не
-// долбили базу SELECT'ами на маленьком боксе.
+// readinessCache caches the ClickHouse probe result so frequent /readyz calls
+// don't hammer the database with SELECTs on a small box.
 type readinessCache struct {
 	cfg    config
 	m      *metrics
@@ -178,8 +178,8 @@ func newReadinessCache(cfg config, m *metrics, ttl time.Duration) *readinessCach
 	}
 }
 
-// loop периодически обновляет кэш (и метрику chReachable), чтобы алерт на
-// logden_clickhouse_reachable работал и без внешнего трафика на /readyz.
+// loop periodically refreshes the cache (and the chReachable metric) so the
+// logden_clickhouse_reachable alert keeps working even without external /readyz traffic.
 func (rc *readinessCache) loop(ctx context.Context) {
 	rc.check()
 	ticker := time.NewTicker(rc.ttl)

@@ -1,10 +1,10 @@
-"""Крошечный клиент для ingest-шлюза logden (только stdlib).
+"""Tiny client for the logden ingest gateway (stdlib only).
 
     from logden_client import LoggerClient
     log = LoggerClient("http://logs.internal:8080", TOKEN, "billing-api")
     log.error("payment timeout", {"order_id": 123})
 
-С батчингом:
+With batching:
 
     log = LoggerClient(EP, TOKEN, "worker", batch=500, interval=1.0)
     ...
@@ -43,7 +43,7 @@ class LoggerClient:
                 try:
                     self.flush()
                 except Exception:
-                    pass  # batch-режим — fire-and-forget; явный flush()/close() ошибку пробросит
+                    pass  # batch mode is fire-and-forget; explicit flush()/close() will surface the error
         else:
             self._send([event])
 
@@ -74,7 +74,7 @@ class LoggerClient:
             try:
                 self.flush()
             except Exception:
-                pass  # сетевая ошибка не должна навсегда убивать фоновый флашер
+                pass  # a network error must not permanently kill the background flusher
 
     def _send(self, events):
         data = json.dumps(events).encode()

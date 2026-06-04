@@ -1,8 +1,8 @@
-// Нагрузочный генератор для ingest-шлюза logden (только stdlib).
+// Load generator for the logden ingest gateway (stdlib only).
 //
 //	go run . -token $LOG_TOKEN -duration 10s -concurrency 8 -batch 50
 //
-// Шлёт батчи в POST /logs из N воркеров заданное время и печатает throughput.
+// Sends batches to POST /logs from N workers for the given time and prints throughput.
 package main
 
 import (
@@ -20,7 +20,7 @@ import (
 
 func main() {
 	url := flag.String("url", "http://localhost:8080", "gateway base URL")
-	token := flag.String("token", os.Getenv("LOG_TOKEN"), "auth token (или LOG_TOKEN)")
+	token := flag.String("token", os.Getenv("LOG_TOKEN"), "auth token (or LOG_TOKEN)")
 	project := flag.String("project", "loadtest", "project name")
 	conc := flag.Int("concurrency", 8, "concurrent workers")
 	dur := flag.Duration("duration", 10*time.Second, "test duration")
