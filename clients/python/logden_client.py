@@ -22,7 +22,8 @@ class LoggerClient:
         self.token = token
         self.project = project
         self.timeout = timeout
-        self.batch = batch
+        # cap at the gateway's MAX_BATCH_EVENTS: a larger batch is rejected with 413
+        self.batch = min(batch, 1000)
         self._buf = []
         self._lock = threading.Lock()
         self._stop = threading.Event()

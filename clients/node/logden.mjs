@@ -14,7 +14,8 @@ export class LoggerClient {
     this.token = token;
     this.project = project;
     this.timeout = timeout;
-    this.batch = batch;
+    // cap at the gateway's MAX_BATCH_EVENTS: a larger batch is rejected with 413
+    this.batch = Math.min(batch, 1000);
     this.buf = [];
     if (batch > 0) {
       this.timer = setInterval(() => this.flush().catch(() => {}), interval);

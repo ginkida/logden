@@ -4,6 +4,21 @@ Format — [Keep a Changelog](https://keepachangelog.com/), versioning — [SemV
 
 ## [Unreleased]
 
+### Added
+- `deploy/prometheus.yml.example` — example scrape config wired to `deploy/alerts.yml`
+  (job names `logden`/`clickhouse`).
+- Dependabot now also tracks the pinned ClickHouse image in `docker-compose.yml`
+  (`docker-compose` ecosystem).
+
+### Fixed
+- Release images now embed the actual build time in `BUILD_DATE`
+  (was the repository-metadata timestamp).
+- Clients cap the batch size at the gateway's `MAX_BATCH_EVENTS` (1000) instead of
+  letting an oversized batch be rejected with 413.
+- The Laravel/Monolog example sends the event as an array, matching the client contract.
+- CI/Release: pinned actions bumped (checkout v6, setup-go v6, metadata-action v6,
+  buildx v4, hadolint v3.3) — Node 20 runner deprecation; builder image golang 1.26-alpine.
+
 ## [0.2.0] — 2026-06-04
 
 ### Added

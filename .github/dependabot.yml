@@ -16,3 +16,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+  # tracks the pinned ClickHouse image in docker-compose.yml
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly

@@ -5,9 +5,9 @@ batching. One contract: `{ project, level, message, context }` + `Authorization:
 
 The clients **do not retry or spool**: if the gateway is down, a single send
 returns an error, and batch mode drops the batch silently (the background flusher swallows errors).
-Reliability (retries, spool, replay) lives on the gateway → ClickHouse leg. Keep your own batch
-≤ 1000 events (the gateway's `MAX_BATCH_EVENTS`). Without `close()` in batch mode
-the remaining buffer is not flushed.
+Reliability (retries, spool, replay) lives on the gateway → ClickHouse leg. The clients
+cap the batch size at 1000 events (the gateway's `MAX_BATCH_EVENTS`; a larger batch
+would be rejected with 413). Without `close()` in batch mode the remaining buffer is not flushed.
 
 ## Go (`clients/go`)
 

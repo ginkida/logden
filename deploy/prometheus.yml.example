@@ -1,0 +1,31 @@
+# Example Prometheus config for logden. Copy to your Prometheus host and adjust
+# targets. Job names must stay `logden` and `clickhouse` — alerts.yml relies on
+# them (see the `up{job="logden"}` expression).
+#
+# Network notes:
+#   - The gateway publishes /metrics on its host port (127.0.0.1:8080 by default;
+#     set METRICS_TOKEN or keep the port loopback-only).
+#   - ClickHouse exposes :9363 only inside the docker network. Either run
+#     Prometheus in the same network (target clickhouse:9363), or publish the
+#     port on host loopback the same way docker-compose.override.yml.example
+#     does for 8123.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 30s
+
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  - job_name: logden
+    static_configs:
+      - targets: ["127.0.0.1:8080"]
+    # If METRICS_TOKEN is set on the gateway:
+    # authorization:
+    #   type: Bearer
+    #   credentials: CHANGE_ME_METRICS_TOKEN
+
+  - job_name: clickhouse
+    static_configs:
+      - targets: ["clickhouse:9363"]

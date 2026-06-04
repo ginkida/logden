@@ -208,7 +208,8 @@ read-only `reader` user. Full-text search — via `hasToken(message, …)`
 `logden_clickhouse_insert_duration_seconds` (histogram), `logden_build_info`.
 ClickHouse has its built-in prometheus endpoint enabled on `:9363` (not published externally).
 Ready-made alert rules — `deploy/alerts.yml` (drops, CH unavailability, spool growth,
-buffer fill, insert latency, ClickHouse memory).
+buffer fill, insert latency, ClickHouse memory); an example Prometheus scrape config —
+`deploy/prometheus.yml.example`.
 
 ## Production
 

@@ -44,6 +44,10 @@ type Client struct {
 	closeOnce sync.Once
 }
 
+// maxBatch mirrors the gateway's default MAX_BATCH_EVENTS limit: a larger
+// client batch would be rejected as a whole with 413.
+const maxBatch = 1000
+
 type Option func(*Client)
 
 // WithHTTPClient swaps in a custom HTTP client (timeouts, transport).
@@ -64,6 +68,9 @@ func New(endpoint, token, project string, opts ...Option) *Client {
 	}
 	for _, o := range opts {
 		o(c)
+	}
+	if c.batch > maxBatch {
+		c.batch = maxBatch
 	}
 	if c.batch > 0 {
 		if c.interval <= 0 {

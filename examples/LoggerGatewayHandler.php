@@ -31,14 +31,15 @@ class LoggerGatewayHandler extends AbstractProcessingHandler
     protected function write(LogRecord $record): void
     {
         try {
+            // The body is an array of events — same shape the batching clients use.
             Http::withToken(env('LOG_GATEWAY_TOKEN'))
                 ->timeout(2)
-                ->post(rtrim(env('LOG_GATEWAY_URL'), '/').'/logs', [
+                ->post(rtrim(env('LOG_GATEWAY_URL'), '/').'/logs', [[
                     'project' => env('LOG_GATEWAY_PROJECT', config('app.name')),
                     'level'   => strtolower($record->level->getName()),
                     'message' => $record->message,
                     'context' => $record->context,
-                ]);
+                ]]);
         } catch (\Throwable $e) {
             // Logging must never break the request. On high-traffic
             // paths, move the send logic to a queue (dispatch).
