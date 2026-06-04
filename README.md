@@ -10,6 +10,10 @@ writes to ClickHouse → analyze with plain SQL. Built for a ~1 GB RAM VPS, with
 minimal dependencies (the gateway uses only the Go stdlib).
 
 [![CI](https://github.com/ginkida/logden/actions/workflows/ci.yml/badge.svg)](https://github.com/ginkida/logden/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/ginkida/logden)](https://github.com/ginkida/logden/releases)
+[![Image](https://img.shields.io/badge/ghcr.io-ginkida%2Flogden-blue)](https://github.com/ginkida/logden/pkgs/container/logden)
+[![Go](https://img.shields.io/badge/go-stdlib%20only-00ADD8?logo=go)](gateway/go.mod)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 > **AI agents:** see [AGENTS.md](AGENTS.md) — a step-by-step operating guide
 > with verifiable commands for deploying, sending logs, and querying.
