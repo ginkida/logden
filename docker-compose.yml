@@ -8,7 +8,7 @@ x-logging: &logging
 
 services:
   clickhouse:
-    image: clickhouse/clickhouse-server:24.8@sha256:1ffa82edee000a42c09313bd9f1293d94c570aee74babc1b3ca9983a35fa597b
+    image: clickhouse/clickhouse-server:26.5@sha256:07afc18d8a9706eb9d85c5c5d2752e5270f91bbc2894caeaecb73e4d0f603bf5
     restart: unless-stopped
     logging: *logging
     mem_limit: 850m
