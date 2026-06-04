@@ -1,5 +1,9 @@
 # logden
 
+<p align="center">
+  <img src="docs/logden.png" alt="logden mascot — a sleepy gopher next to a terminal full of logs" width="420">
+</p>
+
 A compact centralized logging system for multiple projects.
 Any service ships a log with a single HTTP POST → a tiny Go gateway batches and
 writes to ClickHouse → analyze with plain SQL. Built for a ~1 GB RAM VPS, with
