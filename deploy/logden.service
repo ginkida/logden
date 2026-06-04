@@ -1,0 +1,41 @@
+[Unit]
+Description=logden ingest gateway
+After=network.target clickhouse-server.service
+Wants=clickhouse-server.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/logden.env
+ExecStart=/usr/local/bin/logden
+Restart=always
+RestartSec=2
+
+# ресурсы (на 1 ГБ-боксе не конкурируем с ClickHouse)
+MemoryMax=64M
+MemoryHigh=48M
+CPUQuota=50%
+
+# спул переживает рестарты: каталог создаётся systemd под dynamic-юзером
+StateDirectory=logden
+
+# изоляция / sandbox
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

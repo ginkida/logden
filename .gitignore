@@ -1,0 +1,21 @@
+# секреты / локальная конфигурация
+.env
+docker-compose.override.yml
+
+# собранный бинарь шлюза и покрытие
+/gateway/logden
+/gateway/coverage.out
+*.out
+*.test
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# python
+__pycache__/
+
+# harness / session-стейт
+.claude/
+CLAUDE.md

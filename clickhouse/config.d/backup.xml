@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<!--
+  Диск для нативного BACKUP/RESTORE (без внешних зависимостей).
+  Путь лежит внутри тома ch-data (writable). Для настоящего DR копируйте
+  получившиеся бэкапы на другой хост (см. deploy/backup.sh).
+-->
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <backups>
+                <type>local</type>
+                <path>/var/lib/clickhouse/backups/</path>
+            </backups>
+        </disks>
+    </storage_configuration>
+    <backups>
+        <allowed_disk>backups</allowed_disk>
+    </backups>
+</clickhouse>

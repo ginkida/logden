@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<!--
+  Тюнинг ClickHouse под 1 ГБ-бокс (оставляем место под шлюз и ОС).
+  Положить в: /etc/clickhouse-server/config.d/low-mem.xml
+-->
+<clickhouse>
+    <!-- Жёсткий потолок памяти на весь сервер: 768 МБ -->
+    <max_server_memory_usage>805306368</max_server_memory_usage>
+
+    <!-- Кэш засечек: 256 МБ вместо дефолтных 5 ГБ -->
+    <mark_cache_size>268435456</mark_cache_size>
+
+    <!-- Кэш распакованных блоков выключен -->
+    <uncompressed_cache_size>0</uncompressed_cache_size>
+
+    <!-- Ограничиваем пиковую память фоновых мерджей (безопасно, не ломает старт) -->
+    <merge_tree>
+        <max_bytes_to_merge_at_max_space_in_pool>1073741824</max_bytes_to_merge_at_max_space_in_pool>
+        <merge_max_block_size>2048</merge_max_block_size>
+    </merge_tree>
+
+    <!-- listen_host не задаём:
+         - bare metal: ClickHouse по умолчанию слушает только localhost;
+         - docker: официальный образ уже слушает все интерфейсы, порт наружу не публикуется.
+         background_pool_size тоже не трогаем: занижение ломает старт
+         (нужно background_pool_size * concurrency_ratio >= 20). -->
+</clickhouse>

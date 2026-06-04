@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<!--
+  default нужен access management, чтобы init-скрипт создал writer/reader.
+  Ограничиваем default только loopback: init и healthcheck ходят локально, а из
+  docker-сети (от шлюза) работают writer/reader по своим кредам. Это закрывает
+  доступ к беспарольному default из сети без правки init.
+-->
+<clickhouse>
+    <users>
+        <default>
+            <access_management>1</access_management>
+            <networks replace="replace">
+                <ip>127.0.0.1</ip>
+                <ip>::1</ip>
+            </networks>
+        </default>
+    </users>
+</clickhouse>

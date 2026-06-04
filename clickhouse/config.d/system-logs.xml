@@ -1,0 +1,37 @@
+<?xml version="1.0"?>
+<!--
+  Ограничиваем рост системных лог-таблиц ClickHouse: по умолчанию у них нет TTL
+  и они растут бесконечно, а на 1 ГБ-боксе это главный незаметный пожиратель
+  диска и памяти (фоновые мерджи). Тяжёлые и бесполезные для этого проекта логи
+  отключаем (remove="1"), остальные держим 3 дня.
+-->
+<clickhouse>
+    <query_log>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+        <flush_interval_milliseconds>30000</flush_interval_milliseconds>
+    </query_log>
+    <part_log>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+    </part_log>
+    <metric_log>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+        <flush_interval_milliseconds>30000</flush_interval_milliseconds>
+    </metric_log>
+    <asynchronous_metric_log>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+        <flush_interval_milliseconds>60000</flush_interval_milliseconds>
+    </asynchronous_metric_log>
+    <!-- держим лог async-вставок: по нему видны ТИХИЕ потери логов -->
+    <asynchronous_insert_log>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+    </asynchronous_insert_log>
+    <text_log>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+        <level>warning</level>
+    </text_log>
+
+    <query_thread_log remove="1"/>
+    <query_views_log remove="1"/>
+    <trace_log remove="1"/>
+    <session_log remove="1"/>
+</clickhouse>

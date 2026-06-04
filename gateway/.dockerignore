@@ -1,0 +1,6 @@
+Dockerfile
+.dockerignore
+*.md
+*_test.go
+logden
+.golangci.yml

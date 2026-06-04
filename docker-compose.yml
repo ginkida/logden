@@ -1,0 +1,103 @@
+name: logden
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8@sha256:1ffa82edee000a42c09313bd9f1293d94c570aee74babc1b3ca9983a35fa597b
+    restart: unless-stopped
+    logging: *logging
+    mem_limit: 850m
+    cpus: "1.5"
+    security_opt:
+      - "no-new-privileges:true"
+    # cap_drop:[ALL] не выставляем: entrypoint образа делает chown /var/lib/clickhouse
+    # (нужен CAP_CHOWN) и сам дропает привилегии до пользователя clickhouse.
+    environment:
+      CH_WRITER_PASSWORD: ${CH_WRITER_PASSWORD:?set CH_WRITER_PASSWORD in .env}
+      CH_READER_PASSWORD: ${CH_READER_PASSWORD:?set CH_READER_PASSWORD in .env}
+    volumes:
+      - ch-data:/var/lib/clickhouse
+      # тюнинг памяти, профили, системные логи, prometheus, backup
+      - ./clickhouse/config.d/low-mem.xml:/etc/clickhouse-server/config.d/low-mem.xml:ro
+      - ./clickhouse/config.d/system-logs.xml:/etc/clickhouse-server/config.d/system-logs.xml:ro
+      - ./clickhouse/config.d/prometheus.xml:/etc/clickhouse-server/config.d/prometheus.xml:ro
+      - ./clickhouse/config.d/backup.xml:/etc/clickhouse-server/config.d/backup.xml:ro
+      - ./clickhouse/users.d/low-mem.xml:/etc/clickhouse-server/users.d/low-mem.xml:ro
+      # default -> только loopback (для init), доступ управляется
+      - ./docker/clickhouse-access.xml:/etc/clickhouse-server/users.d/access.xml:ro
+      # инициализация при первом старте: схема, затем пользователи из env
+      - ./clickhouse/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+      - ./docker/initdb/20-users.sh:/docker-entrypoint-initdb.d/20-users.sh:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "-q", "SELECT 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    # Порты 8123/9000/9363 НАРУЖУ НЕ публикуем — доступ только из docker-сети.
+
+  gateway:
+    build:
+      context: ./gateway
+      args:
+        VERSION: ${VERSION:-dev}
+        COMMIT: ${COMMIT:-none}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+    # Готовый образ из ghcr вместо локальной сборки: задайте GATEWAY_IMAGE в .env
+    # и поднимайте через `docker compose pull gateway && docker compose up -d`.
+    image: ${GATEWAY_IMAGE:-logden:latest}
+    restart: unless-stopped
+    # >= shutdown-бюджет шлюза: shCtx(15s) + ceil(BUFFER_SIZE/BATCH_SIZE)*3s дренажа
+    stop_grace_period: 45s
+    logging: *logging
+    mem_limit: 96m
+    cpus: "0.5"
+    read_only: true
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    environment:
+      LOG_TOKEN: ${LOG_TOKEN:?set LOG_TOKEN in .env}
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: writer
+      CLICKHOUSE_PASSWORD: ${CH_WRITER_PASSWORD:?set CH_WRITER_PASSWORD in .env}
+      LISTEN_ADDR: ":8080"
+      GOMEMLIMIT: 80MiB        # GC-потолок ниже cgroup mem_limit 96m (Go не читает cgroup mem сам)
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      BATCH_SIZE: ${BATCH_SIZE:-500}
+      BUFFER_SIZE: ${BUFFER_SIZE:-2000}
+      FLUSH_INTERVAL: ${FLUSH_INTERVAL:-1s}
+      SPOOL_DIR: /spool
+      REPLAY_INTERVAL: ${REPLAY_INTERVAL:-30s}
+      RATE_LIMIT_RPS: ${RATE_LIMIT_RPS:-0}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+    volumes:
+      - gw-spool:/spool
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/logden", "-healthcheck"]
+      interval: 10s
+      timeout: 2s
+      retries: 3
+      start_period: 5s
+    ports:
+      # По умолчанию шлюз слушает только loopback хоста: наружу — через
+      # reverse-proxy с TLS (SECURITY.md) или осознанно GATEWAY_BIND=0.0.0.0.
+      - "${GATEWAY_BIND:-127.0.0.1}:${GATEWAY_PORT:-8080}:8080"
+
+volumes:
+  ch-data:
+  gw-spool:

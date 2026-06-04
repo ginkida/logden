@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gateway:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: gateway/go.mod
+      - name: gofmt
+        working-directory: gateway
+        run: |
+          if [ -n "$(gofmt -l .)" ]; then echo "unformatted:"; gofmt -l .; exit 1; fi
+      - name: go vet
+        working-directory: gateway
+        run: go vet ./...
+      - name: staticcheck
+        working-directory: gateway
+        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+      - name: test (race + coverage)
+        working-directory: gateway
+        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+      - name: coverage summary
+        working-directory: gateway
+        run: go tool cover -func=coverage.out | tail -1
+      - name: build
+        working-directory: gateway
+        run: go build -o /dev/null ./...
+      - name: client (go) tests
+        working-directory: clients/go
+        run: go test ./...
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.8@sha256:1ffa82edee000a42c09313bd9f1293d94c570aee74babc1b3ca9983a35fa597b
+        # задаём пароль => entrypoint открывает default для сети (иначе default
+        # ограничен loopback и тест с host получит 403)
+        env:
+          CLICKHOUSE_USER: default
+          CLICKHOUSE_PASSWORD: ci
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "clickhouse-client --password ci -q 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 30
+          --health-start-period 10s
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: gateway/go.mod
+      - name: integration tests
+        working-directory: gateway
+        env:
+          CLICKHOUSE_URL: http://localhost:8123
+          CLICKHOUSE_USER: default
+          CLICKHOUSE_PASSWORD: ci
+        run: go test -tags=integration ./...
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: build gateway image
+        run: docker build -t logden ./gateway
+
+  lint-extra:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: hadolint (Dockerfile)
+        uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
+        with:
+          dockerfile: gateway/Dockerfile
+          failure-threshold: warning
+      - name: shellcheck
+        uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38 # 2.0.0
+      - name: yamllint
+        uses: ibiqlik/action-yamllint@2576378a8e339169678f9939646ee3ee325e845c # v3
+        with:
+          config_file: .yamllint.yml
+          strict: true
+      - name: promtool check rules
+        run: >-
+          docker run --rm -v "$PWD/deploy:/d:ro" --entrypoint promtool
+          prom/prometheus:v3.12.0@sha256:69f5241418838263316593f7274a304b095c40bcf22e57272865da91bd60a8ac
+          check rules /d/alerts.yml

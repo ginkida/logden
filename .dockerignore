@@ -1,0 +1,12 @@
+# Подстраховка на случай сборки из корня (по умолчанию контекст = ./gateway).
+.git
+.github
+.env
+*.md
+deploy
+examples
+clickhouse
+docker
+docker-compose.yml
+**/coverage.out
+**/logden

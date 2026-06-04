@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<!--
+  Профили и лимиты. Положить в: /etc/clickhouse-server/users.d/low-mem.xml
+-->
+<clickhouse>
+    <profiles>
+        <!-- профиль по умолчанию: под ним ходит writer (вставки) -->
+        <default>
+            <max_memory_usage>536870912</max_memory_usage>                       <!-- 512 МБ на запрос -->
+            <max_bytes_before_external_group_by>268435456</max_bytes_before_external_group_by>
+            <async_insert>1</async_insert>
+            <wait_for_async_insert>0</wait_for_async_insert>
+            <async_insert_busy_timeout_ms>2000</async_insert_busy_timeout_ms>    <!-- реже флашим => крупнее части -->
+            <async_insert_max_data_size>3145728</async_insert_max_data_size>     <!-- 3 МБ потолок буфера -->
+            <async_insert_deduplicate>0</async_insert_deduplicate>              <!-- НЕ терять одинаковые лог-строки -->
+        </default>
+
+        <!-- профиль reader: лимиты + readonly-режим. Имя 'readonly' наследует
+             <readonly>1</readonly> от одноимённого stock-профиля, поэтому reader
+             НЕ может менять настройки per-query и обойти эти лимиты. Это намеренно
+             (защита от OOM от одной тяжёлой аналитики/агента). -->
+        <readonly>
+            <max_memory_usage>314572800</max_memory_usage>                       <!-- 300 МБ на запрос -->
+            <max_bytes_before_external_group_by>157286400</max_bytes_before_external_group_by>
+            <max_execution_time>30</max_execution_time>
+            <max_threads>2</max_threads>
+            <max_result_rows>200000</max_result_rows>
+            <result_overflow_mode>break</result_overflow_mode>
+        </readonly>
+    </profiles>
+</clickhouse>
