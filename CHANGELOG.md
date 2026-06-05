@@ -4,6 +4,8 @@ Format — [Keep a Changelog](https://keepachangelog.com/), versioning — [SemV
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-06-05
+
 ### Added
 - `deploy/prometheus.yml.example` — example scrape config wired to `deploy/alerts.yml`
   (job names `logden`/`clickhouse`).
