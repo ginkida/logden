@@ -30,6 +30,20 @@ func (c config) validate() error {
 	add(c.retention <= 0, "RETENTION must be > 0")
 	add(c.rateLimit < 0, "RATE_LIMIT_RPS must be >= 0")
 	add(c.spoolDir != "" && c.spoolMaxFiles <= 0, "SPOOL_MAX_FILES must be > 0 when SPOOL_DIR is set")
+	// Byte caps: 0 disables a cap; a non-zero cap must admit at least one
+	// max-size request, otherwise the gateway rejects everything.
+	add(c.bufferMaxBytes < 0, "BUFFER_MAX_BYTES must be >= 0 (0 = unlimited)")
+	add(c.spoolMaxBytes < 0, "SPOOL_MAX_BYTES must be >= 0 (0 = unlimited)")
+	add(c.maxInflightBytes < 0, "MAX_INFLIGHT_BODY_BYTES must be >= 0 (0 = unlimited)")
+	// Rows re-serialize LARGER than the raw body (context is re-escaped, a
+	// per-row source_ip is added), by up to ~2x for quote-dense payloads — so
+	// the buffer floor is 2× MAX_BODY_BYTES to keep one max-size request always
+	// enqueueable on an empty buffer. The inflight floor only needs 1× because
+	// the semaphore reserves the RAW body size (bodyCost), not the rows.
+	add(c.bufferMaxBytes > 0 && c.bufferMaxBytes < 2*c.maxBodyBytes,
+		"BUFFER_MAX_BYTES must be >= 2× MAX_BODY_BYTES (serialized rows are larger than the raw body)")
+	add(c.maxInflightBytes > 0 && c.maxInflightBytes < c.maxBodyBytes,
+		"MAX_INFLIGHT_BODY_BYTES must be >= MAX_BODY_BYTES (one max-size request must fit)")
 
 	if u, err := url.Parse(c.chBaseURL); err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
 		errs = append(errs, "CLICKHOUSE_URL must be a valid http(s) URL")

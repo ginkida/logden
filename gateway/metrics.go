@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Metrics in Prometheus text exposition format — stdlib only, no dependencies.
@@ -22,6 +23,7 @@ type metrics struct {
 	insertFailed     atomic.Int64
 	insertRetries    atomic.Int64
 	spoolFiles       atomic.Int64
+	spoolBytes       atomic.Int64
 	spoolQuarantined atomic.Int64
 	chReachable      atomic.Int64
 
@@ -29,21 +31,28 @@ type metrics struct {
 	httpReqs  *labeledCounter // logden_http_requests_total{path,code}
 	insertDur *histogram      // logden_clickhouse_insert_duration_seconds
 
-	bufferDepth func() int
-	bufferCap   func() int
+	bufferDepth   func() int
+	bufferCap     func() int
+	bufferBytes   func() int64
+	inflightBytes func() int64
+	spoolCapBytes int64
+	startTime     int64 // unix seconds; restart-loop alert watches changes()
 
 	version, commit string
 }
 
 func newMetrics(version, commit, _ string) *metrics {
 	return &metrics{
-		rejected:    newLabeledCounter(),
-		httpReqs:    newLabeledCounter(),
-		insertDur:   newHistogram(insertBuckets),
-		bufferDepth: func() int { return 0 },
-		bufferCap:   func() int { return 0 },
-		version:     version,
-		commit:      commit,
+		rejected:      newLabeledCounter(),
+		httpReqs:      newLabeledCounter(),
+		insertDur:     newHistogram(insertBuckets),
+		bufferDepth:   func() int { return 0 },
+		bufferCap:     func() int { return 0 },
+		bufferBytes:   func() int64 { return 0 },
+		inflightBytes: func() int64 { return 0 },
+		startTime:     time.Now().Unix(),
+		version:       version,
+		commit:        commit,
 	}
 }
 
@@ -64,8 +73,13 @@ func (m *metrics) render() string {
 	gauge("logden_clickhouse_reachable", "ClickHouse passed the last readiness probe (1/0).", m.chReachable.Load())
 	counter("logden_spool_quarantined_total", "Spool batches rejected by ClickHouse and quarantined as .bad files.", m.spoolQuarantined.Load())
 	gauge("logden_spool_files", "Batches currently spooled to disk awaiting replay.", m.spoolFiles.Load())
+	gauge("logden_spool_bytes", "Bytes on disk in the spool directory (including .bad and .tmp files).", m.spoolBytes.Load())
+	gauge("logden_spool_capacity_bytes", "Configured SPOOL_MAX_BYTES (0 = unlimited).", m.spoolCapBytes)
 	gauge("logden_buffer_events", "Events currently waiting in the in-memory buffer.", int64(m.bufferDepth()))
 	gauge("logden_buffer_capacity", "Configured in-memory buffer capacity.", int64(m.bufferCap()))
+	gauge("logden_buffer_bytes", "Bytes held by the in-memory buffer and the in-flight batch.", m.bufferBytes())
+	gauge("logden_inflight_body_bytes", "Estimated bytes of request bodies being processed right now.", m.inflightBytes())
+	gauge("logden_process_start_time_seconds", "Unix time the gateway process started.", m.startTime)
 
 	b.WriteString("# HELP logden_logs_rejected_total Requests/events rejected before buffering.\n")
 	b.WriteString("# TYPE logden_logs_rejected_total counter\n")

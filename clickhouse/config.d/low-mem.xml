@@ -7,8 +7,11 @@
     <!-- Hard memory ceiling for the whole server: 768 MB -->
     <max_server_memory_usage>805306368</max_server_memory_usage>
 
-    <!-- Mark cache: 256 MB instead of the default 5 GB -->
-    <mark_cache_size>268435456</mark_cache_size>
+    <!-- Mark cache: 128 MB instead of the default 5 GB. For a single narrow
+         table even this is generous; the freed headroom lowers the chance of
+         RSS overshooting the cgroup limit (RSS > max_server_memory_usage is
+         the main OOM-kill vector on a small box). -->
+    <mark_cache_size>134217728</mark_cache_size>
 
     <!-- Uncompressed block cache disabled -->
     <uncompressed_cache_size>0</uncompressed_cache_size>

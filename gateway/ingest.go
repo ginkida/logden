@@ -28,6 +28,10 @@ type chStatusError struct {
 
 func (e *chStatusError) Error() string { return fmt.Sprintf("clickhouse %d: %s", e.code, e.msg) }
 
+// maxBatchBytes flushes a batch early by SIZE (not only by count): it caps the
+// bytes.Join copy and the INSERT body even when individual rows are large.
+const maxBatchBytes = 8 << 20
+
 // ingester is the ingest pipeline: a bounded buffer -> batch worker -> insert
 // into ClickHouse with retries. When retries are exhausted the batch goes to
 // the disk spool (if enabled) and is replayed later. This prevents log loss on
@@ -41,6 +45,11 @@ type ingester struct {
 	wg        sync.WaitGroup
 	enqueueMu sync.Mutex
 	closed    bool // under enqueueMu: channel closed, enqueue no longer sends
+	// bufBytes = bytes admitted into the buffer and not yet flushed (the
+	// worker's in-flight batch included). Incremented under enqueueMu,
+	// decremented by the worker AFTER a flush completes — so buffer + batch
+	// together stay under BUFFER_MAX_BYTES.
+	bufBytes atomic.Int64
 
 	spoolMu    sync.Mutex
 	spoolSeq   uint64
@@ -72,18 +81,21 @@ func newIngester(cfg config, m *metrics) *ingester {
 	}
 }
 
-func (ing *ingester) depth() int    { return len(ing.ch) }
-func (ing *ingester) capacity() int { return cap(ing.ch) }
+func (ing *ingester) depth() int        { return len(ing.ch) }
+func (ing *ingester) capacity() int     { return cap(ing.ch) }
+func (ing *ingester) depthBytes() int64 { return ing.bufBytes.Load() }
 
 // enqueue serializes the rows, stamps source_ip and non-blockingly puts them
 // into the buffer. Returns the number of accepted and dropped (buffer full) rows.
 func (ing *ingester) enqueue(rows []row, ip string) (accepted, dropped int) {
 	// Serialize the rows outside the lock (CPU work doesn't hold the mutex).
 	lines := make([][]byte, 0, len(rows))
+	var total int64
 	for i := range rows {
 		rows[i].SourceIP = ip
 		if line, err := json.Marshal(&rows[i]); err == nil {
 			lines = append(lines, line)
+			total += int64(len(line))
 		} else {
 			dropped++
 		}
@@ -91,12 +103,16 @@ func (ing *ingester) enqueue(rows []row, ip string) (accepted, dropped int) {
 	// All-or-nothing UNDER the mutex: the capacity check and the enqueue are
 	// atomic with respect to other handlers (otherwise a batch retry would
 	// duplicate already-accepted rows). The worker only reads, so free space
-	// can't shrink while we hold the lock.
+	// can't shrink while we hold the lock. The byte budget bounds buffer
+	// memory even when events are near MAX_MESSAGE/CONTEXT_BYTES (the event
+	// count alone would admit BUFFER_SIZE × ~130KB).
 	ing.enqueueMu.Lock()
 	defer ing.enqueueMu.Unlock()
-	if ing.closed || len(ing.ch)+len(lines) > cap(ing.ch) {
+	if ing.closed || len(ing.ch)+len(lines) > cap(ing.ch) ||
+		(ing.cfg.bufferMaxBytes > 0 && ing.bufBytes.Load()+total > ing.cfg.bufferMaxBytes) {
 		return 0, dropped + len(lines)
 	}
+	ing.bufBytes.Add(total)
 	for _, line := range lines {
 		select {
 		case ing.ch <- line:
@@ -145,12 +161,17 @@ func (ing *ingester) worker() {
 	defer ticker.Stop()
 
 	batch := make([][]byte, 0, ing.cfg.batchSize)
+	var batchBytes int64
 	flush := func() {
 		if len(batch) == 0 {
 			return
 		}
 		ing.flush(batch)
-		batch = batch[:0]
+		// The batch has left memory (inserted, spooled or dropped) — only now
+		// release its bytes from the budget, so the buffer and the in-flight
+		// batch stay under BUFFER_MAX_BYTES together.
+		ing.bufBytes.Add(-batchBytes)
+		batch, batchBytes = batch[:0], 0
 	}
 
 	for {
@@ -161,7 +182,8 @@ func (ing *ingester) worker() {
 				return
 			}
 			batch = append(batch, line)
-			if len(batch) >= ing.cfg.batchSize {
+			batchBytes += int64(len(line))
+			if len(batch) >= ing.cfg.batchSize || batchBytes >= maxBatchBytes {
 				flush()
 			}
 		case <-ticker.C:
@@ -246,6 +268,14 @@ func (ing *ingester) spool(body []byte, n int) {
 	if int(ing.m.spoolFiles.Load()) >= ing.cfg.spoolMaxFiles {
 		ing.m.dropped.Add(int64(n))
 		slog.Error("spool full, dropping batch", "events", n)
+		return
+	}
+	// Byte cap on top of the file-count cap: quarantined .bad files also hold
+	// disk space and are counted, so a poisoned spool can't fill the volume.
+	if ing.cfg.spoolMaxBytes > 0 && ing.m.spoolBytes.Load()+int64(len(body)) > ing.cfg.spoolMaxBytes {
+		ing.m.dropped.Add(int64(n))
+		slog.Error("spool byte cap reached, dropping batch",
+			"events", n, "spool_bytes", ing.m.spoolBytes.Load(), "cap", ing.cfg.spoolMaxBytes)
 		return
 	}
 
@@ -367,6 +397,26 @@ func (ing *ingester) spoolFilesList() []string {
 	return names
 }
 
+// updateSpoolGauge refreshes both spool gauges: the replayable file count
+// (*.ndjson only, as before) and the total bytes of ALL files in the spool dir
+// (.ndjson + .bad + .tmp) — the byte cap must see everything that holds disk.
 func (ing *ingester) updateSpoolGauge() {
-	ing.m.spoolFiles.Store(int64(len(ing.spoolFilesList())))
+	entries, err := os.ReadDir(ing.cfg.spoolDir)
+	if err != nil {
+		return
+	}
+	var files, bytesTotal int64
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if strings.HasSuffix(e.Name(), ".ndjson") {
+			files++
+		}
+		if info, err := e.Info(); err == nil {
+			bytesTotal += info.Size()
+		}
+	}
+	ing.m.spoolFiles.Store(files)
+	ing.m.spoolBytes.Store(bytesTotal)
 }

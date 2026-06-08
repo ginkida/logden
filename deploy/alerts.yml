@@ -45,6 +45,21 @@ groups:
           summary: "Spool growing (>50 files for 10m)"
           description: "ClickHouse is likely down for a while — replay can't keep up."
 
+      - alert: LogdenSpoolBytesNearCap
+        expr: (logden_spool_bytes / logden_spool_capacity_bytes > 0.8) and logden_spool_capacity_bytes > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Spool >80% of SPOOL_MAX_BYTES"
+          description: "Above the cap new batches are dropped. Replay stuck or .bad quarantine files piling up — see RUNBOOK."
+
+      - alert: LogdenRestartLoop
+        expr: changes(logden_process_start_time_seconds[15m]) > 2
+        labels: { severity: critical }
+        annotations:
+          summary: "Gateway restarting repeatedly"
+          description: "More than 2 process restarts in 15m — likely an OOM kill loop or a crash; check `docker inspect`/`dmesg`."
+
       - alert: LogdenBufferNearFull
         expr: logden_buffer_events / logden_buffer_capacity > 0.8
         for: 5m
@@ -70,3 +85,11 @@ groups:
         annotations:
           summary: "ClickHouse RSS near the cap"
           description: "RSS close to max_server_memory_usage (768MB) — OOM risk on a 1GB box."
+
+      - alert: ClickHouseDiskLow
+        expr: ClickHouseAsyncMetrics_FilesystemMainPathAvailableBytes < 2e9
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "Less than 2GB free on the ClickHouse data path"
+          description: "Disk is the most likely exhaustion vector on a small VPS: drop old partitions or prune backups — see RUNBOOK (disk full)."

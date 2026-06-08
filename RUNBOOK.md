@@ -13,6 +13,8 @@ docker compose logs clickhouse --tail=200
 dmesg | grep -i oom            # common cause on a 1GB box — OOM
 docker compose restart clickhouse
 ```
+If OOM kills recur, add swap as a safety margin (snippet in README, "RAM budget")
+or move to a 2 GB box — the worst-case ceilings don't fit 1 GB without swap.
 Data in the `ch-data` volume survives the restart. Logs accumulated during the outage sit in the
 spool (`gw-spool` volume) and **are replayed automatically** once it recovers (replay every
 `REPLAY_INTERVAL`). Loss only happens if both the buffer and the spool overflow
@@ -49,6 +51,10 @@ docker compose exec clickhouse clickhouse-client -q \
 docker compose exec clickhouse clickhouse-client -q "ALTER TABLE logs.logs DROP PARTITION '20260101'"
 ```
 CH system logs are capped at 3 days (`config.d/system-logs.xml`).
+The `ClickHouseDiskLow` alert (`deploy/alerts.yml`) fires below 2 GB free on the
+data path — don't wait for a 100% full disk, ClickHouse stops merging well before that.
+Other disk consumers to check: in-volume backups (`deploy/backup.sh` keeps 30 days)
+and the gateway spool (capped at `SPOOL_MAX_BYTES`, 256 MB by default).
 
 ## Monitoring (ad-hoc queries)
 
@@ -91,6 +97,9 @@ distroless gateway has no shell, so use a helper container):
 docker run --rm -v logden_gw-spool:/spool alpine \
   sh -c 'cd /spool && for f in *.ndjson.bad; do mv "$f" "${f%.bad}"; done'
 ```
+`.bad` files keep counting toward `SPOOL_MAX_BYTES` (see `logden_spool_bytes` /
+the `LogdenSpoolBytesNearCap` alert) — if they are not worth requeueing, delete
+them the same way (`rm -- *.ndjson.bad`), otherwise they squeeze out fresh batches.
 
 ## Scaling
 

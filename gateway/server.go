@@ -13,11 +13,12 @@ import (
 )
 
 type server struct {
-	cfg    config
-	m      *metrics
-	ingest *ingester
-	rl     *rateLimiter
-	ready  *readinessCache
+	cfg      config
+	m        *metrics
+	ingest   *ingester
+	rl       *rateLimiter
+	inflight *byteSemaphore
+	ready    *readinessCache
 }
 
 func newServer(cfg config) *server {
@@ -25,9 +26,15 @@ func newServer(cfg config) *server {
 	ing := newIngester(cfg, m)
 	m.bufferDepth = ing.depth
 	m.bufferCap = ing.capacity
+	m.bufferBytes = ing.depthBytes
+	m.spoolCapBytes = cfg.spoolMaxBytes
 	s := &server{cfg: cfg, m: m, ingest: ing}
 	if cfg.rateLimit > 0 {
 		s.rl = newRateLimiter(cfg.rateLimit, cfg.rateBurst)
+	}
+	if cfg.maxInflightBytes > 0 {
+		s.inflight = newByteSemaphore(cfg.maxInflightBytes)
+		m.inflightBytes = s.inflight.inUse
 	}
 	s.ready = newReadinessCache(cfg, m, 5*time.Second)
 	return s
@@ -56,6 +63,18 @@ func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", "1")
 		s.reject(w, "/logs", http.StatusTooManyRequests, "rate_limited")
 		return
+	}
+	// Admission control on body bytes: GOMEMLIMIT is a soft GC target and can't
+	// stop allocations, so concurrent large bodies must be bounded explicitly —
+	// otherwise a burst of max-size uploads OOM-kills the whole gateway.
+	if s.inflight != nil {
+		cost := s.bodyCost(r)
+		if !s.inflight.tryAcquire(cost) {
+			w.Header().Set("Retry-After", "1")
+			s.reject(w, "/logs", http.StatusServiceUnavailable, "overloaded")
+			return
+		}
+		defer s.inflight.release(cost)
 	}
 
 	rows, code, reason := s.parseBatch(r)
@@ -129,6 +148,19 @@ func (s *server) authorized(r *http.Request) bool {
 	return ok
 }
 
+// bodyCost estimates the in-memory cost of a request body BEFORE reading it.
+// Identity bodies are bounded by Content-Length; gzip and chunked bodies can
+// expand to anything up to the body limit, so they reserve the worst case.
+func (s *server) bodyCost(r *http.Request) int64 {
+	if strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") || r.ContentLength < 0 {
+		return s.cfg.maxBodyBytes
+	}
+	if r.ContentLength > s.cfg.maxBodyBytes {
+		return s.cfg.maxBodyBytes
+	}
+	return r.ContentLength
+}
+
 // clientIP trusts X-Forwarded-For only when the connection comes from a
 // trusted proxy (TRUSTED_PROXIES); otherwise it uses the real peer.
 func (s *server) clientIP(r *http.Request) string {
@@ -145,6 +177,39 @@ func (s *server) clientIP(r *http.Request) string {
 		}
 	}
 	return host
+}
+
+// byteSemaphore caps the total estimated body bytes processed concurrently.
+// Non-blocking by design: over the budget the caller answers 503 immediately
+// (backpressure, same contract as a full buffer) instead of queueing goroutines.
+type byteSemaphore struct {
+	mu  sync.Mutex
+	cur int64
+	max int64
+}
+
+func newByteSemaphore(max int64) *byteSemaphore { return &byteSemaphore{max: max} }
+
+func (bs *byteSemaphore) tryAcquire(n int64) bool {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	if bs.cur+n > bs.max {
+		return false
+	}
+	bs.cur += n
+	return true
+}
+
+func (bs *byteSemaphore) release(n int64) {
+	bs.mu.Lock()
+	bs.cur -= n
+	bs.mu.Unlock()
+}
+
+func (bs *byteSemaphore) inUse() int64 {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	return bs.cur
 }
 
 func securityHeaders(next http.Handler) http.Handler {

@@ -59,7 +59,10 @@ services:
     # >= gateway shutdown budget: shCtx(15s) + ceil(BUFFER_SIZE/BATCH_SIZE)*3s drain
     stop_grace_period: 45s
     logging: *logging
-    mem_limit: 96m
+    # Average usage is ~15MB; the limit covers the worst case (inflight bodies
+    # + byte-capped buffer + GC headroom), so a burst degrades to 503 instead
+    # of an OOM kill.
+    mem_limit: 128m
     cpus: "0.5"
     read_only: true
     security_opt:
@@ -72,12 +75,15 @@ services:
       CLICKHOUSE_USER: writer
       CLICKHOUSE_PASSWORD: ${CH_WRITER_PASSWORD:?set CH_WRITER_PASSWORD in .env}
       LISTEN_ADDR: ":8080"
-      GOMEMLIMIT: 80MiB        # GC ceiling below the cgroup mem_limit 96m (Go doesn't read cgroup mem itself)
+      GOMEMLIMIT: 80MiB        # GC ceiling below the cgroup mem_limit 128m (Go doesn't read cgroup mem itself)
       LOG_LEVEL: ${LOG_LEVEL:-info}
       BATCH_SIZE: ${BATCH_SIZE:-500}
       BUFFER_SIZE: ${BUFFER_SIZE:-2000}
+      BUFFER_MAX_BYTES: ${BUFFER_MAX_BYTES:-33554432}             # 32MiB byte cap on the buffer
+      MAX_INFLIGHT_BODY_BYTES: ${MAX_INFLIGHT_BODY_BYTES:-16777216} # 16MiB of concurrent request bodies
       FLUSH_INTERVAL: ${FLUSH_INTERVAL:-1s}
       SPOOL_DIR: /spool
+      SPOOL_MAX_BYTES: ${SPOOL_MAX_BYTES:-268435456}              # 256MiB disk cap for the spool
       REPLAY_INTERVAL: ${REPLAY_INTERVAL:-30s}
       RATE_LIMIT_RPS: ${RATE_LIMIT_RPS:-0}
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}

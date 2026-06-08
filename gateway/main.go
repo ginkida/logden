@@ -40,22 +40,25 @@ type config struct {
 	chTable    string
 
 	bufferSize     int
+	bufferMaxBytes int64
 	batchSize      int
 	flushInterval  time.Duration
 	maxRetries     int
 	spoolDir       string
 	spoolMaxFiles  int
+	spoolMaxBytes  int64
 	replayInterval time.Duration
 
 	rateLimit    float64
 	rateBurst    float64
 	metricsToken string
 
-	maxBodyBytes    int64
-	maxMessageBytes int
-	maxContextBytes int
-	maxBatchEvents  int
-	retention       time.Duration
+	maxBodyBytes     int64
+	maxInflightBytes int64
+	maxMessageBytes  int
+	maxContextBytes  int
+	maxBatchEvents   int
+	retention        time.Duration
 
 	trustedProxies []*net.IPNet
 	logLevel       slog.Level
@@ -94,6 +97,7 @@ func main() {
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    32 << 10, // a token + proxy headers fit easily; the Go default (1MB) is a needless OOM vector
 	}
 
 	go func() {
@@ -123,26 +127,29 @@ func main() {
 
 func loadConfig() (config, error) {
 	cfg := config{
-		listenAddr:      envOr("LISTEN_ADDR", ":8080"),
-		chBaseURL:       envOr("CLICKHOUSE_URL", "http://127.0.0.1:8123"),
-		chUser:          envOr("CLICKHOUSE_USER", "writer"),
-		chDatabase:      envOr("CLICKHOUSE_DB", "logs"),
-		chTable:         envOr("CLICKHOUSE_TABLE", "logs"),
-		bufferSize:      envInt("BUFFER_SIZE", 2000),
-		batchSize:       envInt("BATCH_SIZE", 500),
-		flushInterval:   envDur("FLUSH_INTERVAL", time.Second),
-		maxRetries:      envInt("MAX_RETRIES", 3),
-		spoolDir:        os.Getenv("SPOOL_DIR"),
-		spoolMaxFiles:   envInt("SPOOL_MAX_FILES", 1000),
-		replayInterval:  envDur("REPLAY_INTERVAL", 30*time.Second),
-		rateLimit:       envFloat("RATE_LIMIT_RPS", 0),
-		rateBurst:       envFloat("RATE_BURST", 0),
-		maxBodyBytes:    int64(envInt("MAX_BODY_BYTES", 4<<20)),
-		maxMessageBytes: envInt("MAX_MESSAGE_BYTES", 64<<10),
-		maxContextBytes: envInt("MAX_CONTEXT_BYTES", 64<<10),
-		maxBatchEvents:  envInt("MAX_BATCH_EVENTS", 1000),
-		retention:       envDur("RETENTION", 30*24*time.Hour),
-		logLevel:        parseLevel(envOr("LOG_LEVEL", "info")),
+		listenAddr:       envOr("LISTEN_ADDR", ":8080"),
+		chBaseURL:        envOr("CLICKHOUSE_URL", "http://127.0.0.1:8123"),
+		chUser:           envOr("CLICKHOUSE_USER", "writer"),
+		chDatabase:       envOr("CLICKHOUSE_DB", "logs"),
+		chTable:          envOr("CLICKHOUSE_TABLE", "logs"),
+		bufferSize:       envInt("BUFFER_SIZE", 2000),
+		bufferMaxBytes:   int64(envInt("BUFFER_MAX_BYTES", 32<<20)),
+		batchSize:        envInt("BATCH_SIZE", 500),
+		flushInterval:    envDur("FLUSH_INTERVAL", time.Second),
+		maxRetries:       envInt("MAX_RETRIES", 3),
+		spoolDir:         os.Getenv("SPOOL_DIR"),
+		spoolMaxFiles:    envInt("SPOOL_MAX_FILES", 1000),
+		spoolMaxBytes:    int64(envInt("SPOOL_MAX_BYTES", 256<<20)),
+		replayInterval:   envDur("REPLAY_INTERVAL", 30*time.Second),
+		rateLimit:        envFloat("RATE_LIMIT_RPS", 0),
+		rateBurst:        envFloat("RATE_BURST", 0),
+		maxBodyBytes:     int64(envInt("MAX_BODY_BYTES", 4<<20)),
+		maxInflightBytes: int64(envInt("MAX_INFLIGHT_BODY_BYTES", 16<<20)),
+		maxMessageBytes:  envInt("MAX_MESSAGE_BYTES", 64<<10),
+		maxContextBytes:  envInt("MAX_CONTEXT_BYTES", 64<<10),
+		maxBatchEvents:   envInt("MAX_BATCH_EVENTS", 1000),
+		retention:        envDur("RETENTION", 30*24*time.Hour),
+		logLevel:         parseLevel(envOr("LOG_LEVEL", "info")),
 	}
 	cfg.chKey = readSecret("CLICKHOUSE_PASSWORD")
 	cfg.metricsToken = readSecret("METRICS_TOKEN")

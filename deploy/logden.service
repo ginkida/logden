@@ -10,9 +10,16 @@ ExecStart=/usr/local/bin/logden
 Restart=always
 RestartSec=2
 
-# resources (don't compete with ClickHouse on a 1 GB box)
-MemoryMax=64M
-MemoryHigh=48M
+# resources (don't compete with ClickHouse on a 1 GB box).
+# GOMEMLIMIT must sit BELOW MemoryMax: it is a soft GC target, without it the
+# Go runtime never sees the cgroup limit and the kernel OOM-kills the process.
+# Values from EnvironmentFile override this default.
+# MemoryMax matches the docker mem_limit (128M): GOMEMLIMIT 80MiB + up to 48MiB
+# of byte-capped buffers (BUFFER_MAX_BYTES + MAX_INFLIGHT_BODY_BYTES) need real
+# RSS headroom, so a large-body burst degrades to 503 instead of an OOM kill.
+Environment=GOMEMLIMIT=80MiB
+MemoryHigh=112M
+MemoryMax=128M
 CPUQuota=50%
 
 # spool survives restarts: systemd creates the directory under the dynamic user

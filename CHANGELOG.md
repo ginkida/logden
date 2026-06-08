@@ -4,6 +4,35 @@ Format — [Keep a Changelog](https://keepachangelog.com/), versioning — [SemV
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-06-06
+
+### Added
+- Memory safety caps in the gateway (all configurable, 0 = off):
+  `MAX_INFLIGHT_BODY_BYTES` (default 16 MiB) bounds concurrent request bodies —
+  a burst of large uploads now degrades to `503` + `Retry-After` (reason
+  `overloaded`) instead of risking an OOM kill; `BUFFER_MAX_BYTES` (default
+  32 MiB) bounds the buffer and the in-flight batch by bytes on top of the
+  event-count cap; batches also flush early at 8 MiB.
+- `SPOOL_MAX_BYTES` (default 256 MiB) caps the spool directory on disk;
+  quarantined `*.bad` files count toward the cap.
+- New metrics: `logden_buffer_bytes`, `logden_inflight_body_bytes`,
+  `logden_spool_bytes`, `logden_spool_capacity_bytes`,
+  `logden_process_start_time_seconds`.
+- New alerts (`deploy/alerts.yml`): `ClickHouseDiskLow` (<2 GB free on the data
+  path), `LogdenSpoolBytesNearCap` (>80% of `SPOOL_MAX_BYTES`),
+  `LogdenRestartLoop` (>2 restarts in 15m — OOM-kill loop detector).
+- README: honest worst-case RAM budget and a swap setup snippet for 1 GB boxes.
+
+### Changed
+- Gateway HTTP server sets `MaxHeaderBytes` 32 KiB (Go default is 1 MB).
+- `deploy/logden.service` now sets `GOMEMLIMIT=80MiB` (previously the GC had no
+  ceiling on bare metal) and raises `MemoryMax` 64M→96M / `MemoryHigh` 48M→88M
+  to match the docker profile.
+- Compose: gateway `mem_limit` 96m→128m (headroom for the worst case; average
+  usage is unchanged), new caps surfaced as compose variables.
+- ClickHouse `mark_cache_size` 256 MB→128 MB — generous for a single narrow
+  table; lowers the RSS-overshoot OOM risk within the same 768 MB cap.
+
 ## [0.2.1] — 2026-06-05
 
 ### Added

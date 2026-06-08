@@ -175,10 +175,13 @@ requests.post(f"{os.environ['LOG_GATEWAY_URL']}/logs",
 | `CLICKHOUSE_USER`    | `writer`                 | user for inserts                                |
 | `CLICKHOUSE_PASSWORD`| —                        | password (or `*_FILE`)                          |
 | `BATCH_SIZE`         | `500`                    | batch size                                      |
-| `BUFFER_SIZE`        | `2000`                   | in-memory buffer capacity                       |
+| `BUFFER_SIZE`        | `2000`                   | in-memory buffer capacity (events)              |
+| `BUFFER_MAX_BYTES`   | `33554432`               | byte cap on the buffer + in-flight batch (0 = off) |
+| `MAX_INFLIGHT_BODY_BYTES` | `16777216`          | concurrent request bodies cap; above → `503` (0 = off) |
 | `FLUSH_INTERVAL`     | `1s`                     | flush interval                                  |
 | `MAX_RETRIES`        | `3`                      | insert retries before spooling                  |
 | `SPOOL_DIR`          | (empty)                  | disk spool directory; empty = disabled          |
+| `SPOOL_MAX_BYTES`    | `268435456`              | byte cap on the spool dir, `.bad` included (0 = off) |
 | `REPLAY_INTERVAL`    | `30s`                    | spool replay interval                           |
 | `RATE_LIMIT_RPS`     | `0`                      | request rate limit per second (0 = off)          |
 | `RATE_BURST`         | `0` (=`RATE_LIMIT_RPS`)  | token bucket burst size                          |
@@ -208,12 +211,14 @@ read-only `reader` user. Full-text search — via `hasToken(message, …)`
 `/metrics` exposes (Prometheus): `logden_logs_received_total`,
 `logden_logs_inserted_total`, `logden_logs_dropped_total`,
 `logden_clickhouse_insert_failed_total`, `logden_clickhouse_insert_retries_total`,
-`logden_clickhouse_reachable`, `logden_spool_files`, `logden_buffer_events`,
+`logden_clickhouse_reachable`, `logden_spool_files`, `logden_spool_bytes`,
+`logden_buffer_events`, `logden_buffer_bytes`, `logden_inflight_body_bytes`,
+`logden_process_start_time_seconds`,
 `logden_clickhouse_insert_duration_seconds` (histogram), `logden_build_info`.
 ClickHouse has its built-in prometheus endpoint enabled on `:9363` (not published externally).
-Ready-made alert rules — `deploy/alerts.yml` (drops, CH unavailability, spool growth,
-buffer fill, insert latency, ClickHouse memory); an example Prometheus scrape config —
-`deploy/prometheus.yml.example`.
+Ready-made alert rules — `deploy/alerts.yml` (drops, CH unavailability, spool growth
+by files and bytes, buffer fill, insert latency, restart loop, ClickHouse memory and
+free disk); an example Prometheus scrape config — `deploy/prometheus.yml.example`.
 
 ## Production
 
@@ -228,15 +233,29 @@ buffer fill, insert latency, ClickHouse memory); an example Prometheus scrape co
 
 ## RAM budget (1 GB box)
 
-| Component        | RAM     |
-|------------------|---------|
-| ClickHouse (cap) | ~768 MB (cgroup `mem_limit` 850m) |
-| logden           | ~10-15 MB (`mem_limit` 96m, `GOMEMLIMIT` 80MiB) |
-| OS + overhead    | ~150 MB |
+| Component        | Typical | Ceiling |
+|------------------|---------|---------|
+| ClickHouse       | ~570-600 MB under load | cgroup `mem_limit` 850m (internal cap 768 MB) |
+| logden           | ~10-15 MB | cgroup `mem_limit` 128m (`GOMEMLIMIT` 80MiB) |
+| OS + dockerd     | ~200-280 MB | — |
 
-Measured at idle: gateway ~2 MB, ClickHouse ~190 MB. Gateway memory under load ≈
-`BUFFER_SIZE` × average row size; if you raise `BUFFER_SIZE`, raise `mem_limit`/`GOMEMLIMIT`.
-On 1 GB it is comfortable at defaults; for headroom 2 GB is better.
+Measured: gateway ~2 MB idle / ~15 MB at ~3000 events/s; ClickHouse ~570-600 MB
+under the same load. Gateway memory is bounded by `BUFFER_MAX_BYTES` +
+`MAX_INFLIGHT_BODY_BYTES` (overload degrades to `503` backpressure, not an OOM
+kill); if you raise them, raise `mem_limit`/`GOMEMLIMIT` together.
+
+The worst-case **ceilings** sum above 1 GB — the stack fits a 1 GB box on
+*typical* usage, not on a guaranteed worst case. Two practical consequences:
+
+- **Add swap on a 1 GB VPS** (it is a safety margin, not a performance plan):
+
+  ```bash
+  fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  sysctl vm.swappiness=10   # swap is an emergency exit, not a cache
+  ```
+
+- On 2 GB the defaults run with real headroom — that's the comfortable size.
 
 ## Reliability: what is guaranteed
 
