@@ -62,9 +62,13 @@ func readSecret(name string) string {
 	return os.Getenv(name)
 }
 
+// splitTokens splits LOG_TOKEN on commas and newlines only. Spaces and tabs are
+// NOT separators: a passphrase with a space in it would otherwise become several
+// independently valid tokens, each shorter and easier to guess than the secret
+// the operator thinks they configured.
 func splitTokens(s string) []string {
 	fields := strings.FieldsFunc(s, func(r rune) bool {
-		return r == ',' || r == ' ' || r == '\n' || r == '\t'
+		return r == ',' || r == '\n' || r == '\r'
 	})
 	out := make([]string, 0, len(fields))
 	for _, f := range fields {
@@ -151,6 +155,13 @@ type rateLimiter struct {
 func newRateLimiter(rps, burst float64) *rateLimiter {
 	if burst <= 0 {
 		burst = rps
+	}
+	if burst < 1 {
+		// allow() spends a whole token, so a bucket that can never hold one would
+		// reject every request forever — a fractional RATE_LIMIT_RPS (say 0.5)
+		// would silently take the whole ingest path down. The average rate still
+		// comes from refill; burst is only the ceiling.
+		burst = 1
 	}
 	return &rateLimiter{tokens: burst, max: burst, refill: rps, last: time.Now()}
 }

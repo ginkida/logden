@@ -28,15 +28,18 @@ type metrics struct {
 	chReachable      atomic.Int64
 
 	rejected  *labeledCounter // logden_logs_rejected_total{reason}
+	truncated *labeledCounter // logden_logs_truncated_total{field}
 	httpReqs  *labeledCounter // logden_http_requests_total{path,code}
 	insertDur *histogram      // logden_clickhouse_insert_duration_seconds
 
-	bufferDepth   func() int
-	bufferCap     func() int
-	bufferBytes   func() int64
-	inflightBytes func() int64
-	spoolCapBytes int64
-	startTime     int64 // unix seconds; restart-loop alert watches changes()
+	bufferDepth      func() int
+	bufferCap        func() int
+	bufferBytes      func() int64
+	inflightBytes    func() int64
+	bufferCapBytes   int64
+	inflightCapBytes int64
+	spoolCapBytes    int64
+	startTime        int64 // unix seconds; restart-loop alert watches changes()
 
 	version, commit string
 }
@@ -44,6 +47,7 @@ type metrics struct {
 func newMetrics(version, commit, _ string) *metrics {
 	return &metrics{
 		rejected:      newLabeledCounter(),
+		truncated:     newLabeledCounter(),
 		httpReqs:      newLabeledCounter(),
 		insertDur:     newHistogram(insertBuckets),
 		bufferDepth:   func() int { return 0 },
@@ -78,12 +82,18 @@ func (m *metrics) render() string {
 	gauge("logden_buffer_events", "Events currently waiting in the in-memory buffer.", int64(m.bufferDepth()))
 	gauge("logden_buffer_capacity", "Configured in-memory buffer capacity.", int64(m.bufferCap()))
 	gauge("logden_buffer_bytes", "Bytes held by the in-memory buffer and the in-flight batch.", m.bufferBytes())
+	gauge("logden_buffer_capacity_bytes", "Configured BUFFER_MAX_BYTES (0 = unlimited).", m.bufferCapBytes)
 	gauge("logden_inflight_body_bytes", "Estimated bytes of request bodies being processed right now.", m.inflightBytes())
+	gauge("logden_inflight_body_capacity_bytes", "Configured MAX_INFLIGHT_BODY_BYTES (0 = unlimited).", m.inflightCapBytes)
 	gauge("logden_process_start_time_seconds", "Unix time the gateway process started.", m.startTime)
 
 	b.WriteString("# HELP logden_logs_rejected_total Requests/events rejected before buffering.\n")
 	b.WriteString("# TYPE logden_logs_rejected_total counter\n")
 	m.rejected.render(&b, "logden_logs_rejected_total")
+
+	b.WriteString("# HELP logden_logs_truncated_total Events whose message or context exceeded its size cap.\n")
+	b.WriteString("# TYPE logden_logs_truncated_total counter\n")
+	m.truncated.render(&b, "logden_logs_truncated_total")
 
 	b.WriteString("# HELP logden_http_requests_total HTTP responses by path and status code.\n")
 	b.WriteString("# TYPE logden_http_requests_total counter\n")

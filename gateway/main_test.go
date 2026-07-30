@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,6 +35,17 @@ func testConfig() config {
 		retention:       30 * 24 * time.Hour,
 		logLevel:        slog.LevelError,
 	}
+}
+
+// newLogsRequest builds an authorized POST /logs request for tests that call
+// into the parse layer directly instead of going through the mux.
+func newLogsRequest(body string, hdr map[string]string) *http.Request {
+	req := httptest.NewRequest("POST", "/logs", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer secret")
+	for k, v := range hdr {
+		req.Header.Set(k, v)
+	}
+	return req
 }
 
 func doLogs(s *server, method, token, body string, hdr map[string]string) *httptest.ResponseRecorder {
@@ -169,10 +181,12 @@ func TestBufferFull(t *testing.T) {
 
 func TestInsertPipeline(t *testing.T) {
 	received := make(chan []byte, 1)
+	queries := make(chan url.Values, 1)
 	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		select {
 		case received <- b:
+			queries <- r.URL.Query()
 		default:
 		}
 		w.WriteHeader(http.StatusOK)
@@ -204,11 +218,30 @@ func TestInsertPipeline(t *testing.T) {
 		if m["context"] != `{"a":1}` {
 			t.Fatalf("context should be stored as JSON string, got %v", m["context"])
 		}
-		if _, hasTS := m["timestamp"]; hasTS {
-			t.Fatalf("timestamp should be omitted when client sends none: %s", b)
+		// The gateway stamps ingest time when the client sends none, so a batch
+		// replayed from the spool hours later still carries the original time.
+		ts, _ := m["timestamp"].(string)
+		parsed, err := time.Parse(chTimeLayout, ts)
+		if err != nil {
+			t.Fatalf("timestamp %q is not in ClickHouse format: %v", ts, err)
+		}
+		if d := time.Since(parsed); d < -time.Minute || d > time.Minute {
+			t.Fatalf("ingest timestamp %q is %s away from now", ts, d)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("ClickHouse stub did not receive insert")
+	}
+
+	// The insert URL is part of the contract: without wait_for_async_insert=1 the
+	// gateway never learns that an insert failed, so retries and the spool die
+	// silently. The column list must match the row struct and the table schema.
+	q := <-queries
+	if q.Get("async_insert") != "1" || q.Get("wait_for_async_insert") != "1" {
+		t.Fatalf("insert URL lost its async_insert settings: %v", q)
+	}
+	wantQuery := "INSERT INTO logs.logs (timestamp, project, level, message, context, source_ip) FORMAT JSONEachRow"
+	if got := q.Get("query"); got != wantQuery {
+		t.Fatalf("insert query =\n  %q\nwant\n  %q", got, wantQuery)
 	}
 	waitFor(t, time.Second, func() bool { return s.m.inserted.Load() == 1 })
 }
@@ -359,16 +392,16 @@ func TestNormalizeLevel(t *testing.T) {
 }
 
 func TestNormalizeContext(t *testing.T) {
-	if got := normalizeContext(nil, 1000); got != "{}" {
+	if got, _ := normalizeContext(nil, 1000); got != "{}" {
 		t.Errorf("empty context => %q", got)
 	}
-	if got := normalizeContext(json.RawMessage(`{"a":1}`), 1000); got != `{"a":1}` {
+	if got, _ := normalizeContext(json.RawMessage(`{"a":1}`), 1000); got != `{"a":1}` {
 		t.Errorf("valid context => %q", got)
 	}
-	if got := normalizeContext(json.RawMessage(`{bad`), 1000); !strings.Contains(got, "_invalid_json") {
+	if got, _ := normalizeContext(json.RawMessage(`{bad`), 1000); !strings.Contains(got, "_invalid_json") {
 		t.Errorf("invalid context => %q", got)
 	}
-	if got := normalizeContext(json.RawMessage(`{"a":"`+strings.Repeat("x", 100)+`"}`), 10); !strings.Contains(got, "_truncated") {
+	if got, _ := normalizeContext(json.RawMessage(`{"a":"`+strings.Repeat("x", 100)+`"}`), 10); !strings.Contains(got, "_truncated") {
 		t.Errorf("oversized context => %q", got)
 	}
 }

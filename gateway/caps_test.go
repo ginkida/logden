@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -30,53 +34,382 @@ func TestByteSemaphore(t *testing.T) {
 	}
 }
 
+// The budget must hold under concurrency: at most max/cost holders at any moment,
+// some requests admitted, and nothing leaked once they all return. (Asserting
+// only "inUse() == 0 at the end" would also pass if tryAcquire always failed or
+// if the cap were ignored entirely.)
 func TestByteSemaphoreConcurrent(t *testing.T) {
-	bs := newByteSemaphore(1000)
+	const total, cost, wantHolders = 1000, 100, 10
+	bs := newByteSemaphore(total)
+
+	var holders, maxHolders, granted atomic.Int64
+	release := make(chan struct{})
 	var wg sync.WaitGroup
 	for i := 0; i < 100; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if bs.tryAcquire(10) {
-				bs.release(10)
+			if !bs.tryAcquire(cost) {
+				return
 			}
+			granted.Add(1)
+			cur := holders.Add(1)
+			for {
+				m := maxHolders.Load()
+				if cur <= m || maxHolders.CompareAndSwap(m, cur) {
+					break
+				}
+			}
+			<-release // hold the reservation until every goroutine has tried
+			holders.Add(-1)
+			bs.release(cost)
 		}()
 	}
+	waitFor(t, 2*time.Second, func() bool { return bs.inUse() == total })
+	close(release)
 	wg.Wait()
+
+	// Goroutines that were still starting up when the holders released get their
+	// turn, so the total admitted is >= the budget; what must never happen is more
+	// than budget/cost of them holding at the same time.
+	if got := granted.Load(); got < wantHolders {
+		t.Fatalf("only %d requests admitted, want at least %d (%d budget / %d each)", got, wantHolders, total, cost)
+	}
+	if got := maxHolders.Load(); got != wantHolders {
+		t.Fatalf("peak concurrent holders = %d, want exactly %d (%d budget / %d each)", got, wantHolders, total, cost)
+	}
 	if got := bs.inUse(); got != 0 {
 		t.Fatalf("inUse = %d after all released, want 0", got)
 	}
 }
 
-func TestBodyCost(t *testing.T) {
+// The buffer's byte budget is incremented by handlers and decremented by the
+// worker; a drift under concurrent handlers wedges the gateway at 503 forever.
+func TestEnqueueByteAccountingUnderConcurrency(t *testing.T) {
 	cfg := testConfig()
-	cfg.maxBodyBytes = 1000
+	cfg.bufferSize = 300
+	cfg.bufferMaxBytes = 1 << 20
+	s := newServer(cfg) // no worker started: nothing drains the buffer
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			rows := []row{
+				{Project: "p", Message: strings.Repeat("m", i)},
+				{Project: "p", Message: "second"},
+			}
+			if acc, drop := s.ingest.enqueue(rows, "192.0.2.1"); acc != 2 || drop != 0 {
+				t.Errorf("enqueue = %d/%d, want 2/0", acc, drop)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	var sum int64
+	for n := s.ingest.depth(); n > 0; n-- {
+		sum += int64(len(<-s.ingest.ch))
+	}
+	if got := s.ingest.depthBytes(); got != sum {
+		t.Fatalf("depthBytes = %d but the buffer holds %d bytes: accounting drifted", got, sum)
+	}
+}
+
+func TestReservationChargesOnlyWhatIsRead(t *testing.T) {
+	cfg := testConfig()
+	cfg.maxInflightBytes = 1 << 20
 	s := newServer(cfg)
 
-	// Identity body with Content-Length: the declared size is the cost.
-	req := httptest.NewRequest("POST", "/logs", strings.NewReader("0123456789"))
-	if got := s.bodyCost(req); got != 10 {
-		t.Fatalf("identity cost = %d, want 10", got)
+	res := s.newReservation()
+	// Exactly what is read, never rounded up: rounding to a fixed chunk would cap
+	// concurrency at budget/chunk requests however small their bodies are.
+	if !res.charge(10) {
+		t.Fatal("first charge must be admitted")
+	}
+	if got := s.inflight.inUse(); got != 10 {
+		t.Fatalf("inUse = %d, want exactly 10", got)
+	}
+	if !res.charge(90) {
+		t.Fatal("second charge must be admitted")
+	}
+	if got := s.inflight.inUse(); got != 100 {
+		t.Fatalf("inUse = %d, want exactly 100", got)
+	}
+	// Over the budget the charge is refused and nothing is added.
+	if res.charge(cfg.maxInflightBytes) {
+		t.Fatal("a charge past the budget must be refused")
+	}
+	if got := s.inflight.inUse(); got != 100 {
+		t.Fatalf("a refused charge changed the budget: inUse = %d, want 100", got)
+	}
+	res.release()
+	if got := s.inflight.inUse(); got != 0 {
+		t.Fatalf("inUse = %d after release, want 0", got)
+	}
+	res.release() // double release must not go negative
+	if got := s.inflight.inUse(); got != 0 {
+		t.Fatalf("inUse = %d after double release, want 0", got)
 	}
 
-	// Declared length above the limit is clamped (readBody rejects it anyway).
-	req = httptest.NewRequest("POST", "/logs", strings.NewReader(strings.Repeat("x", 2000)))
-	if got := s.bodyCost(req); got != 1000 {
-		t.Fatalf("oversized cost = %d, want clamp to 1000", got)
+	// Disabled admission control: every call is a no-op that admits.
+	off := newServer(testConfig())
+	if nilRes := off.newReservation(); nilRes != nil || !nilRes.charge(1<<30) {
+		t.Fatal("with MAX_INFLIGHT_BODY_BYTES=0 the reservation must be nil and permissive")
+	}
+}
+
+// The whole point of charging on read: a client that announces a big body and
+// then stalls must not hold the budget hostage (it used to reserve
+// MAX_BODY_BYTES for the entire ReadTimeout, so four sockets 503'd everyone).
+func TestStalledBodyDoesNotHoldBudget(t *testing.T) {
+	cfg := testConfig()
+	cfg.maxInflightBytes = 4 << 20
+	cfg.maxBodyBytes = 4 << 20
+	s := newServer(cfg)
+
+	unblock := make(chan struct{})
+	stalledPrefix := `{"project":"p","mess`
+	stalled := &blockingReader{first: []byte(stalledPrefix), gate: unblock}
+	req := httptest.NewRequest("POST", "/logs", stalled)
+	req.Header.Set("Authorization", "Bearer secret")
+	req.ContentLength = -1 // chunked: the old code reserved the worst case here
+	done := make(chan int, 1)
+	go func() {
+		rr := httptest.NewRecorder()
+		s.mux().ServeHTTP(rr, req)
+		done <- rr.Code
+	}()
+
+	// While it hangs, it must hold only the bytes it actually sent...
+	waitFor(t, 2*time.Second, func() bool { return s.inflight.inUse() > 0 })
+	if got := s.inflight.inUse(); got > int64(len(stalledPrefix)) {
+		t.Fatalf("a stalled request holds %d bytes, want at most the %d it sent", got, len(stalledPrefix))
+	}
+	// ...and the gateway must keep serving everyone else.
+	if rr := doLogs(s, "POST", "secret", `{"project":"p","message":"m"}`, nil); rr.Code != http.StatusNoContent {
+		t.Fatalf("a stalled client blocked a healthy one: got %d", rr.Code)
 	}
 
-	// gzip can expand up to the decompressed limit: reserve the worst case.
-	req = httptest.NewRequest("POST", "/logs", strings.NewReader("xx"))
+	close(unblock)
+	if code := <-done; code != http.StatusBadRequest {
+		t.Fatalf("the truncated body should end as 400, got %d", code)
+	}
+	if got := s.inflight.inUse(); got != 0 {
+		t.Fatalf("inflight bytes leaked after the stalled request: %d", got)
+	}
+}
+
+// blockingReader yields a prefix, then blocks until gate is closed, then EOFs.
+type blockingReader struct {
+	first []byte
+	gate  chan struct{}
+	done  bool
+}
+
+func (b *blockingReader) Read(p []byte) (int, error) {
+	if len(b.first) > 0 {
+		n := copy(p, b.first)
+		b.first = b.first[n:]
+		return n, nil
+	}
+	if !b.done {
+		<-b.gate
+		b.done = true
+	}
+	return 0, io.EOF
+}
+
+// Small gzip/chunked requests must not each cost the worst case: reserving
+// MAX_BODY_BYTES upfront capped concurrency at 4 with the shipped defaults, so
+// a handful of ordinary compressed clients could 503 everyone else.
+func TestManySmallGzipRequestsAreAdmitted(t *testing.T) {
+	cfg := testConfig()
+	cfg.maxBodyBytes = 4 << 20      // upfront reservation would have been this...
+	cfg.maxInflightBytes = 16 << 20 // ...so only 4 could be in flight at once
+	s := newServer(cfg)
+	h := s.mux()
+
+	var body bytes.Buffer
+	gz := gzip.NewWriter(&body)
+	if _, err := gz.Write([]byte(`{"project":"p","message":"small compressed event"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	payload := body.Bytes()
+
+	const conc = 20
+	var ok, shed atomic.Int64
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < conc; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest("POST", "/logs", bytes.NewReader(payload))
+			req.Header.Set("Authorization", "Bearer secret")
+			req.Header.Set("Content-Encoding", "gzip")
+			rr := httptest.NewRecorder()
+			<-start
+			h.ServeHTTP(rr, req)
+			switch rr.Code {
+			case http.StatusNoContent:
+				ok.Add(1)
+			case http.StatusServiceUnavailable:
+				shed.Add(1)
+			default:
+				t.Errorf("unexpected status %d: %s", rr.Code, rr.Body.String())
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := ok.Load(); got != conc {
+		t.Fatalf("%d/%d small gzip requests accepted (%d shed): the budget is still reserved per worst case",
+			got, conc, shed.Load())
+	}
+	if got := s.inflight.inUse(); got != 0 {
+		t.Fatalf("inflight bytes leaked: %d", got)
+	}
+}
+
+// A flood of tiny requests must not be shed for memory it never used: with a
+// per-request minimum charge the budget would cap concurrency at
+// MAX_INFLIGHT_BODY_BYTES/minimum requests regardless of their real size.
+func TestManyTinyRequestsAreNotShed(t *testing.T) {
+	const conc = 200 // 200 x ~30 bytes fits many times over
+	cfg := testConfig()
+	cfg.maxBodyBytes = 4 << 20
+	cfg.maxInflightBytes = 64 << 10 // a single 64KiB "chunk" worth of budget
+	cfg.bufferSize = 2 * conc       // so a 503 can only come from admission control
+	s := newServer(cfg)
+	h := s.mux()
+	var ok, shed atomic.Int64
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < conc; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest("POST", "/logs", strings.NewReader(`{"project":"p","message":"tiny"}`))
+			req.Header.Set("Authorization", "Bearer secret")
+			rr := httptest.NewRecorder()
+			<-start
+			h.ServeHTTP(rr, req)
+			switch rr.Code {
+			case http.StatusNoContent:
+				ok.Add(1)
+			case http.StatusServiceUnavailable:
+				shed.Add(1)
+			default:
+				t.Errorf("unexpected status %d", rr.Code)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := shed.Load(); got != 0 {
+		t.Fatalf("%d/%d tiny requests were shed: the budget is charged in fixed chunks", got, conc)
+	}
+	if got := ok.Load(); got != conc {
+		t.Fatalf("%d/%d tiny requests accepted", got, conc)
+	}
+	if got := s.inflight.inUse(); got != 0 {
+		t.Fatalf("inflight bytes leaked: %d", got)
+	}
+}
+
+// config.validate() accepts MAX_INFLIGHT_BODY_BYTES == MAX_BODY_BYTES on the
+// promise that "one max-size request must fit". Assert the promise end to end at
+// that exact floor — this is what the fixed-chunk accounting used to break.
+func TestMaxSizeBodyFitsAtTheInflightFloor(t *testing.T) {
+	const limit = 1 << 20
+	cfg := testConfig()
+	cfg.maxBodyBytes = limit
+	cfg.maxInflightBytes = limit // the accepted floor, nothing to spare
+	cfg.maxMessageBytes = limit
+	cfg.bufferSize = 10 // a too-small buffer would 503 for a different reason
+	cfg.bufferMaxBytes = 8 * limit
+	cfg.listenAddr, cfg.chBaseURL = ":8080", "http://127.0.0.1:8123"
+	cfg.flushInterval, cfg.replayInterval = time.Second, time.Second
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("equal caps must be a valid config: %v", err)
+	}
+	s := newServer(cfg)
+
+	// ~98% of the limit, in one event.
+	msg := strings.Repeat("m", limit-limit/50)
+	body := `{"project":"p","message":"` + msg + `"}`
+	if int64(len(body)) > cfg.maxBodyBytes {
+		t.Fatalf("test body %d exceeds the limit %d", len(body), cfg.maxBodyBytes)
+	}
+
+	rr := doLogs(s, "POST", "secret", body, nil)
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("a max-size request must fit at the floor: got %d (%s); rejections: %s",
+			rr.Code, rr.Body.String(), s.m.render())
+	}
+	if got := s.inflight.inUse(); got != 0 {
+		t.Fatalf("inflight bytes leaked: %d", got)
+	}
+
+	// One byte over the limit is a 413 (too large), not a 503 (overloaded) — even
+	// though the detection byte is what exhausts the budget at equal caps.
+	over := `{"project":"p","message":"` + strings.Repeat("m", limit) + `"}`
+	rr = doLogs(s, "POST", "secret", over, nil)
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized body: want 413 got %d", rr.Code)
+	}
+	if !strings.Contains(s.m.render(), `logden_logs_rejected_total{reason="too_large"} 1`) {
+		t.Errorf("oversized body must be counted as too_large, not overloaded:\n%s", s.m.render())
+	}
+	if got := s.inflight.inUse(); got != 0 {
+		t.Fatalf("inflight bytes leaked after the 413: %d", got)
+	}
+}
+
+// gzip is charged by what it inflates to, not by its wire size: otherwise the
+// budget would not bound the memory a bomb actually costs.
+func TestGzipChargedByDecompressedSize(t *testing.T) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	if _, err := gz.Write([]byte(`{"project":"p","message":"` + strings.Repeat("x", 200<<10) + `"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := testConfig()
+	cfg.maxBodyBytes = 1 << 20
+	// Above the compressed size, far below the decompressed one.
+	cfg.maxInflightBytes = 128 << 10
+	if int64(buf.Len()) >= cfg.maxInflightBytes {
+		t.Fatalf("test payload compressed to %d bytes, expected well under the budget", buf.Len())
+	}
+	s := newServer(cfg)
+
+	req := httptest.NewRequest("POST", "/logs", bytes.NewReader(buf.Bytes()))
+	req.Header.Set("Authorization", "Bearer secret")
 	req.Header.Set("Content-Encoding", "gzip")
-	if got := s.bodyCost(req); got != 1000 {
-		t.Fatalf("gzip cost = %d, want worst case 1000", got)
-	}
+	rr := httptest.NewRecorder()
+	s.mux().ServeHTTP(rr, req)
 
-	// Unknown length (chunked): worst case too.
-	req = httptest.NewRequest("POST", "/logs", strings.NewReader("xx"))
-	req.ContentLength = -1
-	if got := s.bodyCost(req); got != 1000 {
-		t.Fatalf("chunked cost = %d, want worst case 1000", got)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("want 503 overloaded got %d (%s)", rr.Code, rr.Body.String())
+	}
+	if rr.Header().Get("Retry-After") == "" {
+		t.Fatal("503 overloaded must carry Retry-After")
+	}
+	if got := s.inflight.inUse(); got != 0 {
+		t.Fatalf("inflight bytes leaked: %d", got)
+	}
+	if !strings.Contains(s.m.render(), `logden_logs_rejected_total{reason="overloaded"} 1`) {
+		t.Error("the rejection must be counted as overloaded")
 	}
 }
 

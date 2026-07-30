@@ -63,6 +63,40 @@ func TestIntegrationInsert(t *testing.T) {
 	if got != `error|integration|{"k":1}` {
 		t.Fatalf("row mismatch: %q", got)
 	}
+
+	// The gateway stamps every row itself now, so the format it writes must be a
+	// DateTime64(3) ClickHouse accepts — a stub server cannot catch a bad layout
+	// (JSONEachRow would either reject the insert or store the epoch).
+	age := strings.TrimSpace(chQuery(t, chURL, chUser, chKey,
+		fmt.Sprintf("SELECT abs(dateDiff('second', timestamp, now64(3))) FROM logs.logs WHERE project='%s' LIMIT 1", project)))
+	if age == "" || age == "\\N" {
+		t.Fatalf("timestamp did not round-trip: %q", age)
+	}
+	if secs, err := strconv.Atoi(age); err != nil || secs > 300 {
+		t.Fatalf("stored timestamp is %s seconds away from now (err=%v): the ingest stamp is not being parsed", age, err)
+	}
+
+	// A client-supplied timestamp must survive verbatim, to the millisecond.
+	clientTS := time.Now().UTC().Add(-90 * time.Minute).Truncate(time.Millisecond)
+	body2 := fmt.Sprintf(`{"project":%q,"message":"with client time","timestamp":%q}`,
+		project, clientTS.Format(time.RFC3339Nano))
+	if rr := doLogs(s, "POST", "secret", body2, nil); rr.Code != http.StatusNoContent {
+		t.Fatalf("ingest with client time: want 204 got %d (%s)", rr.Code, rr.Body.String())
+	}
+	want := clientTS.Format("2006-01-02 15:04:05.000")
+	deadline = time.Now().Add(15 * time.Second)
+	var stored string
+	for time.Now().Before(deadline) {
+		stored = strings.TrimSpace(chQuery(t, chURL, chUser, chKey,
+			fmt.Sprintf("SELECT toString(timestamp) FROM logs.logs WHERE project='%s' AND message='with client time' LIMIT 1", project)))
+		if stored != "" {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if stored != want {
+		t.Fatalf("client timestamp stored as %q, want %q", stored, want)
+	}
 }
 
 // applySchema applies clickhouse/schema.sql (several DDL statements split on ';').

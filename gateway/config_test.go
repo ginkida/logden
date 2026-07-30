@@ -42,6 +42,7 @@ func TestConfigValidate(t *testing.T) {
 		"zero retention":     func(c *config) { c.retention = 0 },
 		"bad url":            func(c *config) { c.chBaseURL = "not a url" },
 		"wrong scheme":       func(c *config) { c.chBaseURL = "ftp://x" },
+		"url with path":      func(c *config) { c.chBaseURL = "http://127.0.0.1:8123/logs" },
 		"spool no max":       func(c *config) { c.spoolDir = "/spool"; c.spoolMaxFiles = 0 },
 	}
 	for name, mut := range cases {

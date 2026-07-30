@@ -4,17 +4,23 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
+// chTimeLayout is ClickHouse's DateTime64(3) text format.
+const chTimeLayout = "2006-01-02 15:04:05.000"
+
 // row is one row in the column format of the logs.logs table (JSONEachRow).
-// Context is stored as a JSON string; Timestamp is omitted when the client
-// didn't send a valid time — then ClickHouse fills in DEFAULT now64(3).
+// Context is stored as a JSON string; Timestamp is the client's time when it
+// sent a usable one and the gateway's ingest time otherwise (omitempty is kept
+// as a safety net — an empty column falls back to ClickHouse DEFAULT now64(3)).
 type row struct {
 	Timestamp string `json:"timestamp,omitempty"`
 	Project   string `json:"project"`
@@ -44,20 +50,38 @@ var allowedLevels = map[string]bool{
 	"error": true, "critical": true, "alert": true, "emergency": true,
 }
 
-// readBody decompresses gzip (with gzip-bomb protection) and caps the size.
-func (s *server) readBody(r *http.Request) ([]byte, int, string) {
+// readBody decompresses gzip (with gzip-bomb protection), caps the size and
+// charges the bytes it yields to the inflight budget (res may be nil).
+func (s *server) readBody(r *http.Request, res *reservation) ([]byte, int, string) {
 	limit := s.cfg.maxBodyBytes
-	var src io.Reader = io.LimitReader(r.Body, limit+1)
+	raw := &io.LimitedReader{R: r.Body, N: limit + 1} // cap the wire bytes
+	var src io.Reader = raw
 	if strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") {
-		gz, err := gzip.NewReader(io.LimitReader(r.Body, limit+1))
+		gz, err := gzip.NewReader(raw)
 		if err != nil {
 			return nil, http.StatusBadRequest, "bad_gzip"
 		}
 		defer gz.Close()
 		src = io.LimitReader(gz, limit+1) // cap the DECOMPRESSED size
 	}
-	data, err := io.ReadAll(src)
+	metered := res.meter(src)
+	data, err := io.ReadAll(metered)
 	if err != nil {
+		if errors.Is(err, errOverloaded) {
+			if metered.attempted > limit {
+				// The body itself is over MAX_BODY_BYTES — the budget merely
+				// refused the byte that proved it. Say what is actually wrong
+				// (413) instead of blaming load (503).
+				return nil, http.StatusRequestEntityTooLarge, "too_large"
+			}
+			return nil, http.StatusServiceUnavailable, reasonOverloaded
+		}
+		if raw.N == 0 {
+			// The COMPRESSED stream ran into the cap, so the decompressor saw a
+			// truncated member. That is the same user error as an oversized
+			// identity body — answer 413, not a misleading 400.
+			return nil, http.StatusRequestEntityTooLarge, "too_large"
+		}
 		return nil, http.StatusBadRequest, "read_error"
 	}
 	if int64(len(data)) > limit {
@@ -67,8 +91,8 @@ func (s *server) readBody(r *http.Request) ([]byte, int, string) {
 }
 
 // parseBatch accepts a single object, a JSON array or NDJSON and returns rows.
-func (s *server) parseBatch(r *http.Request) ([]row, int, string) {
-	data, code, reason := s.readBody(r)
+func (s *server) parseBatch(r *http.Request, res *reservation) ([]row, int, string) {
+	data, code, reason := s.readBody(r, res)
 	if code != 0 {
 		return nil, code, reason
 	}
@@ -78,14 +102,38 @@ func (s *server) parseBatch(r *http.Request) ([]row, int, string) {
 	}
 
 	var raws []json.RawMessage
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
 	if trimmed[0] == '[' {
-		if err := json.Unmarshal(trimmed, &raws); err != nil {
+		// Stream the array element by element. json.Unmarshal over the whole body
+		// would materialize EVERY element before the MAX_BATCH_EVENTS check below,
+		// so a MAX_BODY_BYTES body of tiny elements ("[1,1,1,...]") allocates tens
+		// of megabytes inside an 80MiB GOMEMLIMIT — memory the inflight semaphore
+		// never accounted for, because it only charges the raw body size.
+		if _, err := dec.Token(); err != nil { // opening '['
+			return nil, http.StatusBadRequest, "bad_json"
+		}
+		for dec.More() {
+			var raw json.RawMessage
+			if err := dec.Decode(&raw); err != nil {
+				return nil, http.StatusBadRequest, "bad_json"
+			}
+			raws = append(raws, raw)
+			if len(raws) > s.cfg.maxBatchEvents {
+				return nil, http.StatusRequestEntityTooLarge, "too_many_events"
+			}
+		}
+		if _, err := dec.Token(); err != nil { // closing ']' — a truncated array is a 400
+			return nil, http.StatusBadRequest, "bad_json"
+		}
+		// Nothing but whitespace may follow the array, as json.Unmarshal used to
+		// enforce. dec.More() is NOT enough here: it answers false for a trailing
+		// ']' or '}', so "[...]]" would slip through as valid.
+		if _, err := dec.Token(); err != io.EOF {
 			return nil, http.StatusBadRequest, "bad_json"
 		}
 	} else {
 		// Single object or NDJSON: the decoder reads a sequence of JSON values
 		// separated by spaces/newlines.
-		dec := json.NewDecoder(bytes.NewReader(trimmed))
 		for {
 			var raw json.RawMessage
 			err := dec.Decode(&raw)
@@ -108,9 +156,6 @@ func (s *server) parseBatch(r *http.Request) ([]row, int, string) {
 	if len(raws) == 0 {
 		return nil, http.StatusBadRequest, "empty"
 	}
-	if len(raws) > s.cfg.maxBatchEvents {
-		return nil, http.StatusRequestEntityTooLarge, "too_many_events"
-	}
 
 	// Partial accept: one broken element must not drop the whole batch (otherwise
 	// a single bad line loses thousands of good ones, and the retry repeats the
@@ -130,7 +175,10 @@ func (s *server) parseBatch(r *http.Request) ([]row, int, string) {
 		rows = append(rows, rw)
 	}
 	if len(rows) == 0 {
-		return nil, http.StatusBadRequest, "invalid_event"
+		// A distinct request-level reason: "invalid_event" is already counted once
+		// per bad event above, and reusing it here would count the same request
+		// twice under one label.
+		return nil, http.StatusBadRequest, "all_invalid"
 	}
 	return rows, 0, ""
 }
@@ -145,6 +193,7 @@ func (s *server) buildRow(e inEvent) (row, bool) {
 	}
 	msg := e.Message
 	if len(msg) > s.cfg.maxMessageBytes {
+		s.m.truncated.inc(`field="message"`)
 		const suffix = "…[truncated]"
 		if s.cfg.maxMessageBytes <= len(suffix) {
 			msg = strings.ToValidUTF8(msg[:s.cfg.maxMessageBytes], "")
@@ -153,12 +202,24 @@ func (s *server) buildRow(e inEvent) (row, bool) {
 		}
 		// the result is always <= maxMessageBytes
 	}
+	ts := normalizeTimestamp(e.Timestamp, s.cfg.retention)
+	if ts == "" {
+		// Stamp at INGEST time instead of leaving the column to ClickHouse's
+		// DEFAULT now64(3), which is applied at INSERT time: a batch that sits in
+		// the spool through a ClickHouse outage would otherwise be stored with the
+		// replay time, hours after the event actually happened.
+		ts = time.Now().UTC().Format(chTimeLayout)
+	}
+	ctx, ctxTruncated := normalizeContext(e.Context, s.cfg.maxContextBytes)
+	if ctxTruncated {
+		s.m.truncated.inc(`field="context"`)
+	}
 	return row{
-		Timestamp: normalizeTimestamp(e.Timestamp, s.cfg.retention),
+		Timestamp: ts,
 		Project:   project,
 		Level:     normalizeLevel(e.Level),
 		Message:   msg,
-		Context:   normalizeContext(e.Context, s.cfg.maxContextBytes),
+		Context:   ctx,
 	}, true
 }
 
@@ -176,23 +237,34 @@ func normalizeLevel(s string) string {
 	return "info"
 }
 
-func normalizeContext(raw json.RawMessage, max int) string {
+// normalizeContext returns the context to store and whether it was dropped for
+// exceeding MAX_CONTEXT_BYTES (the caller counts that — silent truncation is
+// invisible to an operator otherwise).
+func normalizeContext(raw json.RawMessage, max int) (string, bool) {
 	t := bytes.TrimSpace(raw)
 	if len(t) == 0 || string(t) == "null" {
-		return "{}"
+		return "{}", false
 	}
 	if !json.Valid(t) {
-		return `{"_invalid_json":true}`
+		return `{"_invalid_json":true}`, false
+	}
+	if !utf8.Valid(t) {
+		// json.Valid tolerates raw invalid UTF-8 inside strings, but the row
+		// encoder rewrites every such byte as the 6-byte � escape — a binary
+		// context would serialize ~6x its input size and break the
+		// "rows <= 2x body" budget the BUFFER_MAX_BYTES floor is built on.
+		t = []byte(strings.ToValidUTF8(string(t), "�"))
 	}
 	if len(t) > max {
-		return `{"_truncated":true,"_orig_bytes":` + strconv.Itoa(len(t)) + `}`
+		return `{"_truncated":true,"_orig_bytes":` + strconv.Itoa(len(t)) + `}`, true
 	}
-	return string(t)
+	return string(t), false
 }
 
 // normalizeTimestamp accepts RFC3339 or unix (sec/ms). Returns the time in
-// ClickHouse format, or "" (then CH stamps the insert time). Junk protection:
-// anything more than +5min in the future or older than the retention is dropped.
+// ClickHouse format, or "" when the client sent nothing usable (buildRow then
+// stamps the ingest time). Junk protection: anything more than +5min in the
+// future or older than the retention is dropped.
 func normalizeTimestamp(raw json.RawMessage, retention time.Duration) string {
 	raw = bytes.TrimSpace(raw)
 	if len(raw) == 0 || string(raw) == "null" {
@@ -226,5 +298,5 @@ func normalizeTimestamp(raw json.RawMessage, retention time.Duration) string {
 	if t.After(now.Add(5*time.Minute)) || t.Before(now.Add(-retention)) {
 		return ""
 	}
-	return t.Format("2006-01-02 15:04:05.000")
+	return t.Format(chTimeLayout)
 }

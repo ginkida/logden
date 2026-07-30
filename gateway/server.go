@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -27,6 +28,8 @@ func newServer(cfg config) *server {
 	m.bufferDepth = ing.depth
 	m.bufferCap = ing.capacity
 	m.bufferBytes = ing.depthBytes
+	m.bufferCapBytes = cfg.bufferMaxBytes
+	m.inflightCapBytes = cfg.maxInflightBytes
 	m.spoolCapBytes = cfg.spoolMaxBytes
 	s := &server{cfg: cfg, m: m, ingest: ing}
 	if cfg.rateLimit > 0 {
@@ -47,39 +50,70 @@ func (s *server) mux() http.Handler {
 	mux.HandleFunc("/readyz", s.handleReadyz)
 	mux.HandleFunc("/version", s.handleVersion)
 	mux.HandleFunc("/metrics", s.handleMetrics)
-	return securityHeaders(mux)
+	return securityHeaders(s.countRequests(mux))
+}
+
+// statusRecorder remembers the status code for the request counter.
+type statusRecorder struct {
+	http.ResponseWriter
+	code int
+}
+
+func (w *statusRecorder) WriteHeader(code int) {
+	w.code = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// countRequests counts every response, not only /logs: a 404 storm or a rejected
+// /metrics scrape used to leave no trace at all. The path label goes through a
+// fixed allowlist because labeledCounter does not escape label values, and a
+// user-controlled path would also blow up the metric's cardinality.
+func (s *server) countRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec := &statusRecorder{ResponseWriter: w, code: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		s.m.httpReqs.inc(`path="` + knownPath(r.URL.Path) + `",code="` + itoa(rec.code) + `"`)
+	})
+}
+
+func knownPath(p string) string {
+	switch p {
+	case "/logs", "/healthz", "/readyz", "/metrics", "/version":
+		return p
+	}
+	return "other"
 }
 
 func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		s.reject(w, "/logs", http.StatusMethodNotAllowed, "method")
+		s.reject(w, http.StatusMethodNotAllowed, "method")
 		return
 	}
 	if !s.authorized(r) {
-		s.reject(w, "/logs", http.StatusUnauthorized, "auth")
+		s.reject(w, http.StatusUnauthorized, "auth")
 		return
 	}
 	if s.rl != nil && !s.rl.allow() {
 		w.Header().Set("Retry-After", "1")
-		s.reject(w, "/logs", http.StatusTooManyRequests, "rate_limited")
+		s.reject(w, http.StatusTooManyRequests, "rate_limited")
 		return
 	}
 	// Admission control on body bytes: GOMEMLIMIT is a soft GC target and can't
 	// stop allocations, so concurrent large bodies must be bounded explicitly —
-	// otherwise a burst of max-size uploads OOM-kills the whole gateway.
-	if s.inflight != nil {
-		cost := s.bodyCost(r)
-		if !s.inflight.tryAcquire(cost) {
-			w.Header().Set("Retry-After", "1")
-			s.reject(w, "/logs", http.StatusServiceUnavailable, "overloaded")
-			return
-		}
-		defer s.inflight.release(cost)
-	}
+	// otherwise a burst of max-size uploads OOM-kills the whole gateway. The
+	// budget is charged as the body is actually read (see reservation), not
+	// reserved upfront: a client that announces a big body and then stalls holds
+	// nothing, and small gzip/chunked requests no longer each reserve the
+	// worst case.
+	res := s.newReservation()
+	defer res.release()
 
-	rows, code, reason := s.parseBatch(r)
+	rows, code, reason := s.parseBatch(r, res)
 	if code != 0 {
-		s.reject(w, "/logs", code, reason)
+		if reason == reasonOverloaded {
+			w.Header().Set("Retry-After", "1")
+		}
+		s.reject(w, code, reason)
 		return
 	}
 
@@ -87,11 +121,9 @@ func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	s.m.received.Add(int64(accepted))
 	if dropped > 0 {
 		s.m.dropped.Add(int64(dropped))
-		s.m.httpReqs.inc(`path="/logs",code="503"`)
 		http.Error(w, "buffer full, retry later", http.StatusServiceUnavailable)
 		return
 	}
-	s.m.httpReqs.inc(`path="/logs",code="204"`)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -126,9 +158,10 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.WriteString(w, s.m.render())
 }
 
-func (s *server) reject(w http.ResponseWriter, path string, code int, reason string) {
+// reject answers an error and records why. The HTTP status itself is counted by
+// countRequests, which sees every response.
+func (s *server) reject(w http.ResponseWriter, code int, reason string) {
 	s.m.rejected.inc(`reason="` + reason + `"`)
-	s.m.httpReqs.inc(`path="` + path + `",code="` + itoa(code) + `"`)
 	http.Error(w, http.StatusText(code), code)
 }
 
@@ -148,17 +181,85 @@ func (s *server) authorized(r *http.Request) bool {
 	return ok
 }
 
-// bodyCost estimates the in-memory cost of a request body BEFORE reading it.
-// Identity bodies are bounded by Content-Length; gzip and chunked bodies can
-// expand to anything up to the body limit, so they reserve the worst case.
-func (s *server) bodyCost(r *http.Request) int64 {
-	if strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") || r.ContentLength < 0 {
-		return s.cfg.maxBodyBytes
+// reasonOverloaded is the rejection reason for admission control (503): it also
+// selects the Retry-After header, so it must match on both paths.
+const reasonOverloaded = "overloaded"
+
+// errOverloaded aborts a body read that would exceed MAX_INFLIGHT_BODY_BYTES.
+var errOverloaded = errors.New("inflight body budget exhausted")
+
+// reservation is one request's slice of the inflight byte budget. It is charged
+// for exactly the bytes read (never reserved upfront, never rounded up) and
+// returned in full when the handler ends. Used from a single goroutine — the
+// shared state lives in byteSemaphore.
+//
+// Charging exactly matters in both directions: a stalled client holds only what
+// it actually sent, and a flood of small requests is not rejected for a memory
+// cost it never incurred (rounding up to a fixed chunk would cap /logs at
+// MAX_INFLIGHT_BODY_BYTES/chunk concurrent requests regardless of their size).
+type reservation struct {
+	sem  *byteSemaphore
+	held int64
+}
+
+// newReservation returns nil when admission control is disabled; every method is
+// nil-safe so the handler needs no branches.
+func (s *server) newReservation() *reservation {
+	if s.inflight == nil {
+		return nil
 	}
-	if r.ContentLength > s.cfg.maxBodyBytes {
-		return s.cfg.maxBodyBytes
+	return &reservation{sem: s.inflight}
+}
+
+// charge accounts n bytes just read. Returns false when the budget is exhausted —
+// the caller must give up on the request (the bytes are discarded, so nothing is
+// accounted twice). One mutex acquisition per Read is noise next to parsing.
+func (r *reservation) charge(n int64) bool {
+	if r == nil {
+		return true
 	}
-	return r.ContentLength
+	if !r.sem.tryAcquire(n) {
+		return false
+	}
+	r.held += n
+	return true
+}
+
+func (r *reservation) release() {
+	if r == nil || r.held == 0 {
+		return
+	}
+	r.sem.release(r.held)
+	r.held = 0
+}
+
+// meter wraps a body reader so the bytes it yields are charged to the
+// reservation. Wrapping the DECOMPRESSED stream is deliberate: the budget bounds
+// memory, and a gzip bomb costs what it inflates to, not what it weighs on the wire.
+// Safe with a nil reservation (admission control disabled): it then only counts.
+func (r *reservation) meter(src io.Reader) *meteredReader {
+	return &meteredReader{r: src, res: r}
+}
+
+type meteredReader struct {
+	r         io.Reader
+	res       *reservation
+	delivered int64 // charged and handed to the caller
+	attempted int64 // delivered + the read the budget refused (0 if none)
+}
+
+func (m *meteredReader) Read(p []byte) (int, error) {
+	n, err := m.r.Read(p)
+	if n > 0 {
+		if !m.res.charge(int64(n)) {
+			// Remember how far the body actually goes: readBody uses it to tell an
+			// oversized body (413) from genuine load (503).
+			m.attempted = m.delivered + int64(n)
+			return 0, errOverloaded
+		}
+		m.delivered += int64(n)
+	}
+	return n, err
 }
 
 // clientIP trusts X-Forwarded-For only when the connection comes from a
@@ -229,9 +330,10 @@ type readinessCache struct {
 	ttl    time.Duration
 	client *http.Client
 
-	mu   sync.Mutex
-	last time.Time
-	ok   bool
+	mu      sync.Mutex
+	last    time.Time
+	ok      bool
+	probing bool // single-flight: one probe in flight, others serve the last value
 }
 
 func newReadinessCache(cfg config, m *metrics, ttl time.Duration) *readinessCache {
@@ -261,11 +363,16 @@ func (rc *readinessCache) loop(ctx context.Context) {
 
 func (rc *readinessCache) check() bool {
 	rc.mu.Lock()
-	if !rc.last.IsZero() && time.Since(rc.last) < rc.ttl {
+	fresh := !rc.last.IsZero() && time.Since(rc.last) < rc.ttl
+	// Single-flight: /readyz is unauthenticated, so without this every concurrent
+	// request that finds the entry expired would fire its own ClickHouse query —
+	// exactly the stampede this cache exists to prevent.
+	if fresh || rc.probing {
 		ok := rc.ok
 		rc.mu.Unlock()
 		return ok
 	}
+	rc.probing = true
 	rc.mu.Unlock()
 
 	ok := rc.probe()
@@ -273,6 +380,7 @@ func (rc *readinessCache) check() bool {
 	rc.mu.Lock()
 	rc.ok = ok
 	rc.last = time.Now()
+	rc.probing = false
 	rc.mu.Unlock()
 
 	if ok {

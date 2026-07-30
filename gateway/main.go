@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -78,6 +79,12 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.logLevel})))
 	if cfg.metricsToken == "" {
 		slog.Warn("METRICS_TOKEN is not set — /metrics is publicly accessible")
+	}
+	if cfg.maxBatchEvents > cfg.bufferSize {
+		// Not fatal (small batches keep working), but a full-size batch can then
+		// never be enqueued, not even on an idle gateway: every one is a 503.
+		slog.Warn("MAX_BATCH_EVENTS exceeds BUFFER_SIZE — a full-size client batch can never be accepted",
+			"max_batch_events", cfg.maxBatchEvents, "buffer_size", cfg.bufferSize)
 	}
 
 	srv := newServer(cfg)
@@ -151,6 +158,10 @@ func loadConfig() (config, error) {
 		retention:        envDur("RETENTION", 30*24*time.Hour),
 		logLevel:         parseLevel(envOr("LOG_LEVEL", "info")),
 	}
+	// Both the insert URL and the readiness probe are built by concatenating
+	// chBaseURL + "/?query=..."; a trailing slash would produce "//" and every
+	// request would miss ClickHouse's query handler.
+	cfg.chBaseURL = strings.TrimRight(cfg.chBaseURL, "/")
 	cfg.chKey = readSecret("CLICKHOUSE_PASSWORD")
 	cfg.metricsToken = readSecret("METRICS_TOKEN")
 	cfg.tokens = splitTokens(readSecret("LOG_TOKEN"))

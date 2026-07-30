@@ -38,15 +38,26 @@ func (c config) validate() error {
 	// Rows re-serialize LARGER than the raw body (context is re-escaped, a
 	// per-row source_ip is added), by up to ~2x for quote-dense payloads — so
 	// the buffer floor is 2× MAX_BODY_BYTES to keep one max-size request always
-	// enqueueable on an empty buffer. The inflight floor only needs 1× because
-	// the semaphore reserves the RAW body size (bodyCost), not the rows.
+	// enqueueable on an empty buffer. It is a floor, not the worst case: a body
+	// of invalid UTF-8 reaches ~3x, because the JSON decoder expands every bad
+	// byte in `message` into a 3-byte U+FFFD before the row is built (the
+	// shipped defaults leave 8x, so only a config pinned at the floor would ever
+	// see such a request rejected). The inflight floor only needs 1×: that
+	// budget is charged for the raw bytes read, not for the rows.
 	add(c.bufferMaxBytes > 0 && c.bufferMaxBytes < 2*c.maxBodyBytes,
 		"BUFFER_MAX_BYTES must be >= 2× MAX_BODY_BYTES (serialized rows are larger than the raw body)")
 	add(c.maxInflightBytes > 0 && c.maxInflightBytes < c.maxBodyBytes,
 		"MAX_INFLIGHT_BODY_BYTES must be >= MAX_BODY_BYTES (one max-size request must fit)")
 
-	if u, err := url.Parse(c.chBaseURL); err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+	u, err := url.Parse(c.chBaseURL)
+	switch {
+	case err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https"):
 		errs = append(errs, "CLICKHOUSE_URL must be a valid http(s) URL")
+	case u.Path != "" && u.Path != "/":
+		// The insert URL is built as chBaseURL + "/?query=...", so a path prefix
+		// silently points every insert at something that is not ClickHouse's
+		// query handler.
+		errs = append(errs, "CLICKHOUSE_URL must not contain a path")
 	}
 
 	if len(errs) > 0 {
