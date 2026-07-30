@@ -26,6 +26,9 @@ type Event struct {
 	Level   string         `json:"level,omitempty"`
 	Message string         `json:"message"`
 	Context map[string]any `json:"context,omitempty"`
+	// Timestamp is RFC3339; the client stamps it when the event is recorded, so
+	// batching delay and gateway queueing don't move the event in time.
+	Timestamp string `json:"timestamp,omitempty"`
 }
 
 // Client sends events to the gateway. Safe for concurrent use.
@@ -44,9 +47,13 @@ type Client struct {
 	closeOnce sync.Once
 }
 
-// maxBatch mirrors the gateway's default MAX_BATCH_EVENTS limit: a larger
-// client batch would be rejected as a whole with 413.
-const maxBatch = 1000
+// maxBatch mirrors the gateway's default MAX_BATCH_EVENTS limit and maxBodyBytes
+// its default MAX_BODY_BYTES: the gateway rejects an oversized request as a
+// whole (413), so the client splits instead of losing the batch.
+const (
+	maxBatch     = 1000
+	maxBodyBytes = 4 << 20
+)
 
 type Option func(*Client)
 
@@ -85,7 +92,13 @@ func New(endpoint, token, project string, opts ...Option) *Client {
 
 // Log records an event: it buffers in batch mode, otherwise sends immediately.
 func (c *Client) Log(level, message string, fields map[string]any) error {
-	e := Event{Project: c.project, Level: level, Message: message, Context: fields}
+	e := Event{
+		Project:   c.project,
+		Level:     level,
+		Message:   message,
+		Context:   fields,
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+	}
 	if c.batch > 0 {
 		c.mu.Lock()
 		c.buf = append(c.buf, e)
@@ -103,17 +116,31 @@ func (c *Client) Info(msg string, f map[string]any) error  { return c.Log("info"
 func (c *Client) Warn(msg string, f map[string]any) error  { return c.Log("warning", msg, f) }
 func (c *Client) Error(msg string, f map[string]any) error { return c.Log("error", msg, f) }
 
-// Flush sends the buffered batch right away.
+// Flush sends what is buffered right now, in wire batches of at most maxBatch
+// events. The chunking matters: concurrent Log() calls can push the buffer past
+// the gateway's MAX_BATCH_EVENTS between two flushes, and an oversized batch is
+// rejected as a whole — every event in it would be lost.
 func (c *Client) Flush() error {
 	c.mu.Lock()
-	if len(c.buf) == 0 {
-		c.mu.Unlock()
-		return nil
-	}
-	batch := c.buf
-	c.buf = nil
+	pending := len(c.buf)
 	c.mu.Unlock()
-	return c.send(batch)
+
+	var firstErr error
+	for sent := 0; sent < pending; sent += maxBatch {
+		c.mu.Lock()
+		n := min(len(c.buf), maxBatch)
+		if n == 0 {
+			c.mu.Unlock()
+			break
+		}
+		chunk := c.buf[:n:n] // capped: later appends can't reach into this chunk
+		c.buf = c.buf[n:]
+		c.mu.Unlock()
+		if err := c.send(chunk); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // Close stops the background flusher and sends what's left (batch mode).
@@ -145,6 +172,20 @@ func (c *Client) send(events []Event) error {
 	body, err := json.Marshal(events)
 	if err != nil {
 		return err
+	}
+	// Bound the request by bytes too: a few hundred events with large contexts
+	// stay under MAX_BATCH_EVENTS but exceed MAX_BODY_BYTES, and the gateway
+	// answers 413 for the whole batch.
+	if len(body) > maxBodyBytes && len(events) > 1 {
+		// Both halves are always attempted: returning on the first error would
+		// silently drop the sibling half (and everything above it in the
+		// recursion), which the caller has already removed from the buffer.
+		half := len(events) / 2
+		firstErr := c.send(events[:half])
+		if err := c.send(events[half:]); firstErr == nil {
+			firstErr = err
+		}
+		return firstErr
 	}
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, c.endpoint+"/logs", bytes.NewReader(body))
 	if err != nil {
