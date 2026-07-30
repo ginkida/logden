@@ -68,6 +68,26 @@ groups:
           summary: "Gateway buffer >80%"
           description: "Backpressure: the worker can't flush to ClickHouse fast enough."
 
+      - alert: LogdenBufferBytesNearFull
+        expr: (logden_buffer_bytes / logden_buffer_capacity_bytes > 0.8) and logden_buffer_capacity_bytes > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Gateway buffer >80% of BUFFER_MAX_BYTES"
+          description: >-
+            With large events the byte budget fills long before the event count does —
+            above the cap requests are answered 503 and the events are dropped.
+
+      - alert: LogdenTrafficShed
+        expr: increase(logden_logs_rejected_total{reason=~"overloaded|rate_limited"}[5m]) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Gateway is shedding traffic"
+          description: >-
+            Requests rejected by admission control (MAX_INFLIGHT_BODY_BYTES) or the rate
+            limiter. Clients do not retry, so this is log loss — raise the caps or the limit.
+
       - alert: LogdenInsertLatencyHigh
         expr: histogram_quantile(0.99, sum(rate(logden_clickhouse_insert_duration_seconds_bucket[5m])) by (le)) > 2
         for: 10m

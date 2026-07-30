@@ -12,7 +12,11 @@ services:
     restart: unless-stopped
     logging: *logging
     mem_limit: 850m
-    cpus: "1.5"
+    # Must not exceed the host's CPU count: the daemon rejects the container
+    # outright ("range of CPUs is from 0.01 to N"), and with depends_on the whole
+    # stack then fails to come up. 1.0 is safe on the 1-vCPU VPS this profile
+    # targets; raise it (e.g. 1.5) on a box with more cores.
+    cpus: "1.0"
     security_opt:
       - "no-new-privileges:true"
     # We don't set cap_drop:[ALL]: the image entrypoint chowns /var/lib/clickhouse

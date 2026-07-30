@@ -9,6 +9,11 @@ EnvironmentFile=/etc/logden.env
 ExecStart=/usr/local/bin/logden
 Restart=always
 RestartSec=2
+# Must cover the full drain: 15s HTTP shutdown + ceil(BUFFER_SIZE/BATCH_SIZE) x 3s
+# of flushing the remainder (to ClickHouse or the spool). Set explicitly because
+# a host with a low DefaultTimeoutStopSec would SIGKILL mid-drain and lose the
+# buffered events. Keep in sync with stop_grace_period in docker-compose.yml.
+TimeoutStopSec=45
 
 # resources (don't compete with ClickHouse on a 1 GB box).
 # GOMEMLIMIT must sit BELOW MemoryMax: it is a soft GC target, without it the
