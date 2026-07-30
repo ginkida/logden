@@ -70,16 +70,21 @@ Content-Encoding: gzip            (optional)
   "level":     "error",           // opt.; normalized (warn→warning), defaults to info
   "message":   "Payment timeout",  // required; truncated if it exceeds the limit
   "context":   { "order_id": 123 },// opt.; any JSON
-  "timestamp": "2026-06-02T10:00:00Z" // opt.; RFC3339 or unix (sec/ms); otherwise insertion time
+  "timestamp": "2026-06-02T10:00:00Z" // opt.; RFC3339 or unix (sec/ms); otherwise ingest time
 }
 ```
 
 - **Batch:** the body may be a JSON array `[ {...}, {...} ]` or NDJSON (one object per line).
 - **Partial accept:** invalid batch elements are skipped (the
   `logden_logs_rejected_total{reason="invalid_event"}` metric), valid ones are accepted; the whole
-  batch is rejected (`400`) only if none are valid.
-- Response: `204 No Content`. Errors: `400` (validation), `401` (token), `413` (size),
-  `429` (rate limit), `503` (buffer full).
+  batch is rejected (`400`) only if none are valid — that request is counted once as
+  `reason="all_invalid"`.
+- **Event time:** a missing or unusable `timestamp` is stamped by the gateway when the event is
+  accepted, not when the row reaches ClickHouse — a batch replayed from the spool after an outage
+  keeps the time it actually happened.
+- Response: `204 No Content`. Errors: `400` (validation), `401` (token), `405` (method),
+  `413` (body over `MAX_BODY_BYTES` or more than `MAX_BATCH_EVENTS` events),
+  `429` (rate limit), `503` + `Retry-After` (buffer full, or admission control shedding).
 - The token can be sent in `Authorization: Bearer <…>` or in the `X-Log-Token: <…>` header.
 - `source_ip` is set by the gateway (see `TRUSTED_PROXIES`).
 
@@ -102,7 +107,7 @@ docker compose up -d --build
 
 Without building from source — use the prebuilt image from ghcr (published on release tag `v*`):
 ```bash
-# in .env: GATEWAY_IMAGE=ghcr.io/ginkida/logden:0.2.0
+# in .env: GATEWAY_IMAGE=ghcr.io/ginkida/logden:0.3.0
 docker compose pull gateway && docker compose up -d
 ```
 
@@ -171,13 +176,13 @@ requests.post(f"{os.environ['LOG_GATEWAY_URL']}/logs",
 |----------------------|--------------------------|-------------------------------------------------|
 | `LOG_TOKEN`          | —                        | shared token(s), comma-separated; required       |
 | `LISTEN_ADDR`        | `:8080`                  | listen address                                  |
-| `CLICKHOUSE_URL`     | `http://127.0.0.1:8123`  | ClickHouse address                              |
+| `CLICKHOUSE_URL`     | `http://127.0.0.1:8123`  | ClickHouse address; scheme + host only, a path is refused at startup |
 | `CLICKHOUSE_USER`    | `writer`                 | user for inserts                                |
 | `CLICKHOUSE_PASSWORD`| —                        | password (or `*_FILE`)                          |
 | `BATCH_SIZE`         | `500`                    | batch size                                      |
 | `BUFFER_SIZE`        | `2000`                   | in-memory buffer capacity (events)              |
 | `BUFFER_MAX_BYTES`   | `33554432`               | byte cap on the buffer + in-flight batch (0 = off) |
-| `MAX_INFLIGHT_BODY_BYTES` | `16777216`          | concurrent request bodies cap; above → `503` (0 = off) |
+| `MAX_INFLIGHT_BODY_BYTES` | `16777216`          | bytes of request bodies in flight, charged as read; above → `503` (0 = off) |
 | `FLUSH_INTERVAL`     | `1s`                     | flush interval                                  |
 | `MAX_RETRIES`        | `3`                      | insert retries before spooling                  |
 | `SPOOL_DIR`          | (empty)                  | disk spool directory; empty = disabled          |
@@ -197,7 +202,9 @@ requests.post(f"{os.environ['LOG_GATEWAY_URL']}/logs",
 | `CLICKHOUSE_DB` / `_TABLE` | `logs` / `logs`    | database/table name                             |
 
 The source of truth for config is `loadConfig` in `gateway/main.go`.
-Secrets can be supplied via file: `LOG_TOKEN_FILE`, `CLICKHOUSE_PASSWORD_FILE`.
+Secrets can be supplied via file: `LOG_TOKEN_FILE`, `CLICKHOUSE_PASSWORD_FILE`,
+`METRICS_TOKEN_FILE` (the file wins over the plain variable, and is trimmed).
+`LOG_TOKEN` is split on commas and newlines only — a token may contain spaces.
 
 ## Analysis
 
@@ -212,8 +219,12 @@ read-only `reader` user. Full-text search — via `hasToken(message, …)`
 `logden_logs_inserted_total`, `logden_logs_dropped_total`,
 `logden_clickhouse_insert_failed_total`, `logden_clickhouse_insert_retries_total`,
 `logden_clickhouse_reachable`, `logden_spool_files`, `logden_spool_bytes`,
-`logden_buffer_events`, `logden_buffer_bytes`, `logden_inflight_body_bytes`,
-`logden_process_start_time_seconds`,
+`logden_spool_capacity_bytes`, `logden_spool_quarantined_total`,
+`logden_buffer_events`, `logden_buffer_capacity`, `logden_buffer_bytes`,
+`logden_buffer_capacity_bytes`, `logden_inflight_body_bytes`,
+`logden_inflight_body_capacity_bytes`, `logden_process_start_time_seconds`,
+`logden_logs_rejected_total{reason}`, `logden_logs_truncated_total{field}`,
+`logden_http_requests_total{path,code}`,
 `logden_clickhouse_insert_duration_seconds` (histogram), `logden_build_info`.
 ClickHouse has its built-in prometheus endpoint enabled on `:9363` (not published externally).
 Ready-made alert rules — `deploy/alerts.yml` (drops, CH unavailability, spool growth
@@ -244,6 +255,11 @@ under the same load. Gateway memory is bounded by `BUFFER_MAX_BYTES` +
 `MAX_INFLIGHT_BODY_BYTES` (overload degrades to `503` backpressure, not an OOM
 kill); if you raise them, raise `mem_limit`/`GOMEMLIMIT` together.
 
+The saturating worst case — the buffer full to `BUFFER_MAX_BYTES` while
+`MAX_INFLIGHT_BODY_BYTES` worth of max-size requests are being parsed — peaks at
+~85 MB RSS with the shipped defaults, i.e. inside `mem_limit` 128m. Reproduce it
+after changing any cap: `cd gateway && LOGDEN_MEM_PROBE=1 GOMEMLIMIT=80MiB go test -run WorstCaseHeap -v`.
+
 The worst-case **ceilings** sum above 1 GB — the stack fits a 1 GB box on
 *typical* usage, not on a guaranteed worst case. Two practical consequences:
 
@@ -264,8 +280,10 @@ acknowledgment (`wait_for_async_insert=1`) and retries. When ClickHouse is unava
 goes to the disk spool and is replayed after recovery —
 logs are not lost on a brief outage/database restart. The disk spool is enabled via
 `SPOOL_DIR` (set by default in Docker); without it, durability during an outage/shutdown
-is not guaranteed. Loss is possible only when both the buffer and the spool are full (then
-`logden_logs_dropped_total` grows and `503` is returned).
+is not guaranteed. Every way a log can still be lost is counted — watch
+`logden_logs_dropped_total` (buffer or spool full, and batches ClickHouse rejected into
+`.bad` quarantine) and `logden_logs_rejected_total` (bad token, invalid event, rate limit,
+admission control): clients never retry, so a rejected request is a lost event too.
 
 ## License
 

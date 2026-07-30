@@ -17,8 +17,9 @@ If OOM kills recur, add swap as a safety margin (snippet in README, "RAM budget"
 or move to a 2 GB box — the worst-case ceilings don't fit 1 GB without swap.
 Data in the `ch-data` volume survives the restart. Logs accumulated during the outage sit in the
 spool (`gw-spool` volume) and **are replayed automatically** once it recovers (replay every
-`REPLAY_INTERVAL`). Loss only happens if both the buffer and the spool overflow
-(`logden_logs_dropped_total` > 0).
+`REPLAY_INTERVAL`). Loss shows up in `logden_logs_dropped_total` (buffer or spool full, or a
+batch quarantined as `.bad`) and in `logden_logs_rejected_total` (rate limit, admission
+control, bad token, invalid event) — clients do not retry, so both count.
 
 ## Rotating the shared token (no downtime)
 
@@ -53,8 +54,9 @@ docker compose exec clickhouse clickhouse-client -q "ALTER TABLE logs.logs DROP 
 CH system logs are capped at 3 days (`config.d/system-logs.xml`).
 The `ClickHouseDiskLow` alert (`deploy/alerts.yml`) fires below 2 GB free on the
 data path — don't wait for a 100% full disk, ClickHouse stops merging well before that.
-Other disk consumers to check: in-volume backups (`deploy/backup.sh` keeps 30 days)
-and the gateway spool (capped at `SPOOL_MAX_BYTES`, 256 MB by default).
+Other disk consumers to check: in-volume backups (`deploy/backup.sh` keeps
+`RETAIN_DAYS`, 7 by default — each one is a FULL copy of the table) and the
+gateway spool (capped at `SPOOL_MAX_BYTES`, 256 MB by default).
 
 ## Monitoring (ad-hoc queries)
 
@@ -69,7 +71,10 @@ curl -s localhost:8080/metrics | grep -E 'logden_(logs|spool|clickhouse)'
 ## Backup / restore
 
 ```bash
-./deploy/backup.sh                       # BACKUP into Disk('backups') + 30-day rotation
+./deploy/backup.sh                       # rotate (RETAIN_DAYS=7), check free space, then BACKUP
+# It refuses to run when free space < table size + MIN_FREE_BYTES (2 GB): a full
+# disk stops ClickHouse accepting inserts, which costs more than a missed backup.
+RETAIN_DAYS=14 MIN_FREE_BYTES=$((5*1024*1024*1024)) ./deploy/backup.sh   # e.g. on a bigger disk
 # restore: RESTORE won't overwrite an existing table —
 # restore into a temporary name and swap them:
 docker compose exec clickhouse clickhouse-client -q \
@@ -100,6 +105,13 @@ docker run --rm -v logden_gw-spool:/spool alpine \
 `.bad` files keep counting toward `SPOOL_MAX_BYTES` (see `logden_spool_bytes` /
 the `LogdenSpoolBytesNearCap` alert) — if they are not worth requeueing, delete
 them the same way (`rm -- *.ndjson.bad`), otherwise they squeeze out fresh batches.
+
+`*.ndjson.delivered` is a different case: the batch **was** inserted, but the file
+could not be deleted (a read-only or full volume — check the gateway log for
+`spool file delivered but not removed`). Renaming it keeps replay from inserting it
+again on every tick; the content is already in ClickHouse, so delete these files
+(`rm -- *.ndjson.delivered`) and fix the volume. Like `.bad`, they keep counting
+toward `SPOOL_MAX_BYTES` until removed, squeezing out fresh batches.
 
 ## Scaling
 

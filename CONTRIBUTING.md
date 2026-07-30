@@ -26,10 +26,19 @@ cd gateway && CLICKHOUSE_URL=http://localhost:8123 CLICKHOUSE_USER=default \
   go test -tags=integration ./...
 ```
 
+Memory probe (opt-in, not part of `make test`): drives the gateway into the worst
+case its byte caps admit and fails if the peak RSS leaves the container limit.
+Re-run it whenever you change `BUFFER_MAX_BYTES`, `MAX_INFLIGHT_BODY_BYTES`,
+`MAX_BODY_BYTES` or the parse path:
+```bash
+cd gateway && LOGDEN_MEM_PROBE=1 GOMEMLIMIT=80MiB go test -run WorstCaseHeap -v
+```
+
 ## Before a PR
 
 - `gofmt` and `go vet` clean; `make test` green (or `cd gateway && go test -race ./...`).
 - Changing the `/logs` contract or the ClickHouse schema → add an entry to [CHANGELOG.md](CHANGELOG.md).
+- Changing a memory cap or the parse path → re-run the memory probe above.
 - Changing the schema on a live table → ALTER in `clickhouse/migrations.sql`, don't edit `schema.sql`.
 - Commits — short and to the point.
 

@@ -42,11 +42,11 @@ docker compose up -d --build
 ```
 
 or use the prebuilt image (no Go toolchain, no build; check
-<https://github.com/ginkida/logden/releases> for the latest tag — `0.2.0` below
+<https://github.com/ginkida/logden/releases> for the latest tag — `0.3.0` below
 is an example):
 
 ```bash
-sed -i.bak "s|^GATEWAY_IMAGE=.*|GATEWAY_IMAGE=ghcr.io/ginkida/logden:0.2.0|" .env && rm -f .env.bak
+sed -i.bak "s|^GATEWAY_IMAGE=.*|GATEWAY_IMAGE=ghcr.io/ginkida/logden:0.3.0|" .env && rm -f .env.bak
 docker compose pull gateway && docker compose up -d
 ```
 
@@ -93,13 +93,14 @@ per line). Fields per event:
 | `project` | yes | your application name; `[A-Za-z0-9._-]`, max 64 chars. New projects need no registration — just send. |
 | `message` | yes | non-empty; truncated beyond 64 KiB |
 | `level` | no | normalized (`warn`→`warning`, `err`→`error`, `fatal`→`critical`); unknown → `info` |
-| `context` | no | any JSON object; truncated beyond 64 KiB |
-| `timestamp` | no | RFC3339 or unix sec/ms; >5 min in the future or older than retention → server time is used |
+| `context` | no | any JSON object; beyond 64 KiB it is DISCARDED and replaced by `{"_truncated":true,"_orig_bytes":N}` |
+| `timestamp` | no | RFC3339 or unix sec/ms; >5 min in the future or older than retention → the gateway's ingest time is used |
 
-Responses: `204` accepted; `400` invalid; `401` bad token; `413` body > 4 MiB;
-`429` rate-limited; `503` buffer full (retry later). Batches are accepted
-partially: invalid events are skipped, `400` only if every event is invalid.
-Max 1000 events per request.
+Responses: `204` accepted; `400` invalid; `401` bad token; `405` wrong method;
+`413` too large (body > 4 MiB **or** more than 1000 events); `429` rate-limited;
+`503` buffer full **or** admission control shedding (`Retry-After: 1` — retry later).
+Batches are accepted partially: invalid events are skipped, `400` only if every
+event is invalid. Max 1000 events per request.
 
 Zero-dependency client libraries with optional batching: `clients/go`,
 `clients/python/logden_client.py`, `clients/node/logden.mjs`; Laravel/Monolog
