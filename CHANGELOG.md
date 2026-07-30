@@ -4,6 +4,16 @@ Format — [Keep a Changelog](https://keepachangelog.com/), versioning — [SemV
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-07-30
+
+**Upgrading an existing installation:** apply the `MODIFY COLUMN timestamp
+DateTime64(3, 'UTC')` migration from `clickhouse/migrations.sql` (metadata-only,
+instant) — without it, a ClickHouse server whose timezone is not UTC stores every
+row shifted by its offset. Check with `SELECT timezone()`; on `UTC` nothing was
+shifted and the migration is still worth applying so the column is unambiguous.
+Nothing else requires action: the gateway is drop-in, and the `/logs` contract is
+backward compatible.
+
 ### Fixed
 - **`logs.logs.timestamp` is pinned to `DateTime64(3, 'UTC')`.** The gateway writes
   a naive UTC string, and a column without a timezone is parsed in the *server's*
