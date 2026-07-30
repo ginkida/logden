@@ -24,11 +24,18 @@ WHERE project = 'billing-api' AND level = 'error'
 ORDER BY timestamp DESC
 LIMIT 50;
 
--- Search a field inside context (JSON stored as a string)
+-- Search a field inside context (JSON stored as a string).
+-- ALWAYS bound it by time: JSONExtract reads the whole context column, no index
+-- applies, and without the partition filter the reader profile hits its 30s
+-- max_execution_time on a table of any size. hasToken narrows the scan first
+-- (the value must be a whole token — for a substring drop that line).
 SELECT timestamp, project, message, JSONExtractInt(context, 'order_id') AS order_id
 FROM logs.logs
-WHERE JSONExtractInt(context, 'order_id') = 123
-ORDER BY timestamp DESC;
+WHERE timestamp > now() - INTERVAL 24 HOUR
+  AND hasToken(context, '123')
+  AND JSONExtractInt(context, 'order_id') = 123
+ORDER BY timestamp DESC
+LIMIT 100;
 
 -- Full-text search over the message.
 -- hasToken uses the idx_msg_tokens skip index (fast, no full scan).
@@ -67,10 +74,16 @@ WHERE database = 'logs' AND table = 'logs' AND active
 GROUP BY partition
 ORDER BY partition DESC;
 
--- ClickHouse memory relative to the cap (768 MB)
+-- ClickHouse memory relative to the cap (768 MB). MemoryResident is an async
+-- metric; MemoryTracking is a CurrentMetric and lives in system.metrics — asking
+-- for it in asynchronous_metrics silently returns nothing.
 SELECT metric, formatReadableSize(value) AS v
 FROM system.asynchronous_metrics
-WHERE metric IN ('MemoryResident', 'MemoryTracking');
+WHERE metric = 'MemoryResident'
+UNION ALL
+SELECT metric, formatReadableSize(value)
+FROM system.metrics
+WHERE metric = 'MemoryTracking';
 
 -- Accumulated server errors
 SELECT name, value FROM system.errors WHERE value > 0 ORDER BY value DESC;

@@ -7,7 +7,11 @@ CREATE DATABASE IF NOT EXISTS logs;
 
 CREATE TABLE IF NOT EXISTS logs.logs
 (
-    timestamp  DateTime64(3) DEFAULT now64(3) CODEC(DoubleDelta, ZSTD(1)),
+    -- 'UTC' is pinned deliberately: the gateway sends a naive "YYYY-MM-DD hh:mm:ss.mmm"
+    -- string in UTC, and a column without a timezone is parsed in the SERVER's
+    -- timezone — on a host set to, say, Asia/Almaty every row would land 5 hours
+    -- off (measured), taking the partition day and the TTL with it.
+    timestamp  DateTime64(3, 'UTC') DEFAULT now64(3) CODEC(DoubleDelta, ZSTD(1)),
     project    LowCardinality(String),
     level      LowCardinality(String) DEFAULT 'info',
     message    String                 CODEC(ZSTD(1)),

@@ -6,6 +6,15 @@
 -- inside docker that is default on loopback). Apply with:
 --   docker compose exec clickhouse clickhouse-client --multiquery < clickhouse/migrations.sql
 
+-- --- Pin the timestamp column to UTC (tables created before this was in schema.sql) ---
+-- The gateway writes a naive UTC string; a DateTime64(3) without a timezone is
+-- parsed in the SERVER's timezone, so on a non-UTC host every row lands shifted
+-- (verified: Asia/Almaty stored 12:00 UTC as 07:00 UTC). Metadata-only, instant:
+-- ALTER TABLE logs.logs MODIFY COLUMN timestamp DateTime64(3, 'UTC');
+-- Check the server first: SELECT timezone();  -- 'UTC' => nothing was shifted
+-- NOTE: rows already written on a non-UTC server keep their shift; the ALTER only
+-- fixes how new values are parsed and how all of them are displayed.
+
 -- --- Add a column (safe: JSONEachRow by name, old INSERTs keep working) ---
 -- ALTER TABLE logs.logs ADD COLUMN IF NOT EXISTS trace_id String DEFAULT '' CODEC(ZSTD(1));
 -- After this the gateway can start sending the trace_id field; old rows get the DEFAULT.
