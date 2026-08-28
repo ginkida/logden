@@ -18,7 +18,10 @@ fmt: ## formatting
 	cd $(GATEWAY) && gofmt -w .
 
 lint: ## vet + staticcheck
-	cd $(GATEWAY) && go vet ./... && go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+# Same pin as .github/workflows/ci.yml. On @latest a local `make lint` and CI can
+# run different analyzer versions, so the check that gates the merge is not the
+# check the author ran; bump both in one commit.
+	cd $(GATEWAY) && go vet ./... && go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
 
 run: ## run the gateway locally (needs ClickHouse and LOG_TOKEN)
 	cd $(GATEWAY) && go run .

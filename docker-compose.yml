@@ -10,6 +10,16 @@ services:
   clickhouse:
     image: clickhouse/clickhouse-server:24.8@sha256:1ffa82edee000a42c09313bd9f1293d94c570aee74babc1b3ca9983a35fa597b
     restart: unless-stopped
+    # The same 60s the gateway gets, for a connected reason: compose stops in
+    # reverse dependency order, so the gateway drains into a live ClickHouse and
+    # only then does this container see SIGTERM. What is left to do at that point
+    # is flush the async-insert queue and the system log buffers (up to a 30s
+    # flush interval, clickhouse/config.d/system-logs.xml) and unwind the merge
+    # that is running — on one vCPU a merge here covers up to
+    # max_bytes_to_merge_at_max_space_in_pool = 1GiB (config.d/low-mem.xml).
+    # Docker's default 10s SIGKILLs straight through that: the un-flushed rows
+    # are lost and startup has to clean up the temporary part directories.
+    stop_grace_period: 60s
     logging: *logging
     mem_limit: 850m
     # Must not exceed the host's CPU count: the daemon rejects the container
@@ -21,6 +31,15 @@ services:
       - "no-new-privileges:true"
     # We don't set cap_drop:[ALL]: the image entrypoint chowns /var/lib/clickhouse
     # (needs CAP_CHOWN) and drops privileges to the clickhouse user itself.
+
+    # CH_WRITER_PASSWORD/CH_READER_PASSWORD are read once, by
+    # docker/initdb/20-users.sh, on the first start of an empty ch-data volume;
+    # on every later start they are inert. They stay listed anyway: rebuilding
+    # the volume has to reproduce the same accounts, and
+    # CH_WRITER_PASSWORD is the single source that both this user and the
+    # gateway's CLICKHOUSE_PASSWORD below come from — split them and they drift,
+    # after which the gateway presents a password ClickHouse never had. See the
+    # secrets note on the gateway service for why these are plain env vars.
     environment:
       CH_WRITER_PASSWORD: ${CH_WRITER_PASSWORD:?set CH_WRITER_PASSWORD in .env}
       CH_READER_PASSWORD: ${CH_READER_PASSWORD:?set CH_READER_PASSWORD in .env}
@@ -42,11 +61,33 @@ services:
         soft: 262144
         hard: 262144
     healthcheck:
-      test: ["CMD", "clickhouse-client", "-q", "SELECT 1"]
+      # Probe the docker-network address the gateway itself uses, never loopback.
+      # On the volume's first start the entrypoint runs a temporary server bound
+      # to --listen_host=127.0.0.1 so it can execute /docker-entrypoint-initdb.d;
+      # a loopback probe is answered by that server, so the container turned
+      # healthy and depends_on released the gateway before 20-users.sh had
+      # created writer — and the gateway's first inserts failed authentication.
+      # The temporary server does not bind this address, so a green check here
+      # also proves init finished.
+      # wget on /ping, not clickhouse-client: /ping needs no auth (and
+      # docker/clickhouse-access.xml pins 'default' to loopback, so a client
+      # probe from this address would be rejected outright), and it keeps the
+      # healthcheck from re-executing the fat clickhouse binary inside the 850m
+      # cgroup every interval. wget is present — the image's own entrypoint waits
+      # on /ping with it. --tries=1 because wget otherwise keeps retrying a
+      # refused connection well past the healthcheck timeout.
+      test: ["CMD", "wget", "--spider", "-q", "--tries=1", "--timeout=3", "http://clickhouse:8123/ping"]
       interval: 5s
-      timeout: 3s
+      timeout: 5s
       retries: 30
-      start_period: 10s
+      # 60s, not the 10s that was enough for the loopback probe: this one now
+      # stays red for the whole of first-start init (temporary server up ->
+      # schema -> users -> temporary server down -> real server up), which on a
+      # cold 1-vCPU VPS is a minute of work. Failures inside start_period do not
+      # count against retries, and a success ends it early, so a warm restart
+      # pays nothing for this. Overrun it and the container is declared unhealthy
+      # and `depends_on: service_healthy` fails the whole stack.
+      start_period: 60s
     # Ports 8123/9000/9363 are NOT published externally — access only from the docker network.
 
   gateway:
@@ -60,8 +101,10 @@ services:
     # and bring it up with `docker compose pull gateway && docker compose up -d`.
     image: ${GATEWAY_IMAGE:-logden:latest}
     restart: unless-stopped
-    # >= gateway shutdown budget: shCtx(15s) + ceil(BUFFER_SIZE/BATCH_SIZE)*3s drain
-    stop_grace_period: 45s
+    # >= gateway shutdown budget: shCtx(15s) + one insert already in flight when the
+    # drain began (15s, it keeps the pre-drain timeout) + ceil(BUFFER_SIZE/BATCH_SIZE)*3s
+    # drain = ~42s at the defaults. Keep in sync with TimeoutStopSec in deploy/logden.service.
+    stop_grace_period: 60s
     logging: *logging
     # Average usage is ~15MB; the limit covers the worst case (inflight bodies
     # + byte-capped buffer + GC headroom), so a burst degrades to 503 instead
@@ -73,23 +116,73 @@ services:
       - "no-new-privileges:true"
     cap_drop:
       - ALL
+    # Secrets reach both containers as plain environment variables, and that is a
+    # decision rather than an oversight. compose `secrets:` would work — the
+    # gateway already reads LOG_TOKEN_FILE / CLICKHOUSE_PASSWORD_FILE /
+    # METRICS_TOKEN_FILE (readSecret in gateway/util.go) and
+    # docker/initdb/20-users.sh reads CH_*_PASSWORD_FILE, so the opt-in exists end
+    # to end — but on the single-VPS deployment this stack targets it relocates
+    # the secret instead of protecting it: reading `docker inspect` needs the
+    # docker socket, and the docker socket is root on that host, which already
+    # reads ./secrets/* and the .env beside it. The cost is concrete: one .env
+    # workflow becomes two, the ${VAR:?...} guards that fail loudly on an unset
+    # value become a mount error, and RUNBOOK's zero-downtime token rotation is
+    # written against .env.
+    #
+    # Residual exposure, stated so nobody has to guess: the values are readable
+    # through `docker inspect`, `docker compose config`, the container config JSON
+    # under /var/lib/docker/containers (root only), and /proc/<pid>/environ for
+    # the container's own uid. Treat that output as secret-bearing — above all do
+    # not paste it into an issue or hand it to an agent. To opt out: add a
+    # top-level `secrets:` block with `file: ./secrets/<name>` (secrets/ is
+    # already gitignored), attach it to this service, and swap LOG_TOKEN for
+    # LOG_TOKEN_FILE: /run/secrets/<name> and CLICKHOUSE_PASSWORD for
+    # CLICKHOUSE_PASSWORD_FILE. /run/secrets is mounted read-only, so it stays
+    # compatible with read_only: true above.
+
+    # Every knob loadConfig (gateway/main.go) reads is listed here: a variable that
+    # is only in .env and not in this block never reaches the container, so setting
+    # it looks effective and silently does nothing. Defaults below are the Go
+    # defaults verbatim — keep them identical when adding a variable.
     environment:
       LOG_TOKEN: ${LOG_TOKEN:?set LOG_TOKEN in .env}
       CLICKHOUSE_URL: http://clickhouse:8123
       CLICKHOUSE_USER: writer
       CLICKHOUSE_PASSWORD: ${CH_WRITER_PASSWORD:?set CH_WRITER_PASSWORD in .env}
+      # Must name the objects clickhouse/schema.sql created on the volume's first
+      # start; renaming them here alone points every insert at a missing table.
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-logs}
+      CLICKHOUSE_TABLE: ${CLICKHOUSE_TABLE:-logs}
+      # Fixed: the published port and the healthcheck both target container :8080.
+      # The host side is GATEWAY_BIND/GATEWAY_PORT under ports: below.
       LISTEN_ADDR: ":8080"
       GOMEMLIMIT: 80MiB        # GC ceiling below the cgroup mem_limit 128m (Go doesn't read cgroup mem itself)
       LOG_LEVEL: ${LOG_LEVEL:-info}
       BATCH_SIZE: ${BATCH_SIZE:-500}
+      # Raising BUFFER_SIZE (or lowering BATCH_SIZE) lengthens the drain by 3s per
+      # extra full batch — keep it inside stop_grace_period above, and raise
+      # mem_limit/GOMEMLIMIT with it.
       BUFFER_SIZE: ${BUFFER_SIZE:-2000}
       BUFFER_MAX_BYTES: ${BUFFER_MAX_BYTES:-33554432}             # 32MiB byte cap on the buffer
       MAX_INFLIGHT_BODY_BYTES: ${MAX_INFLIGHT_BODY_BYTES:-16777216} # 16MiB of concurrent request bodies
       FLUSH_INTERVAL: ${FLUSH_INTERVAL:-1s}
+      MAX_RETRIES: ${MAX_RETRIES:-3}                              # retries after the first insert attempt, then the batch is spooled
       SPOOL_DIR: /spool
       SPOOL_MAX_BYTES: ${SPOOL_MAX_BYTES:-268435456}              # 256MiB disk cap for the spool
+      SPOOL_MAX_FILES: ${SPOOL_MAX_FILES:-1000}                   # second spool cap, by batch count
       REPLAY_INTERVAL: ${REPLAY_INTERVAL:-30s}
       RATE_LIMIT_RPS: ${RATE_LIMIT_RPS:-0}
+      RATE_BURST: ${RATE_BURST:-0}                                # 0 = equal to RATE_LIMIT_RPS
+      # Per-request limits. MAX_BODY_BYTES is the floor the two byte caps above are
+      # validated against (BUFFER >= 2x, INFLIGHT >= 1x), so raising it alone is
+      # refused at startup — raise them together.
+      MAX_BODY_BYTES: ${MAX_BODY_BYTES:-4194304}
+      MAX_BATCH_EVENTS: ${MAX_BATCH_EVENTS:-1000}                 # keep <= BUFFER_SIZE, else a full-size batch is always a 503
+      MAX_MESSAGE_BYTES: ${MAX_MESSAGE_BYTES:-65536}
+      MAX_CONTEXT_BYTES: ${MAX_CONTEXT_BYTES:-65536}
+      # An older client timestamp does not lose the event, only its own time:
+      # the gateway stores the ingest time instead (logden_logs_restamped_total).
+      RETENTION: ${RETENTION:-720h}                               # keep in sync with the table TTL
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
       METRICS_TOKEN: ${METRICS_TOKEN:-}
     volumes:

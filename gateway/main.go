@@ -120,9 +120,13 @@ func main() {
 	<-ctx.Done()
 	slog.Info("shutdown signal received, draining")
 
-	// The shutdown budget must fit within docker stop_grace_period (45s):
-	// 15s to drain HTTP connections + buffer drain
+	// The shutdown budget must fit within docker stop_grace_period (60s):
+	// 15s to drain HTTP connections + one insert that was already in flight when
+	// the drain began (it keeps the pre-drain 15s timeout, because insertOnce
+	// reads the flag when the request starts) + the buffer drain
 	// (ceil(BUFFER_SIZE/BATCH_SIZE) × insertOnce 3s while draining).
+	// ~42s at the shipped defaults; a shorter outer timeout SIGKILLs the drain
+	// and the buffered events never reach the spool.
 	shCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := httpServer.Shutdown(shCtx); err != nil {

@@ -171,8 +171,12 @@ func TestBufferFull(t *testing.T) {
 	if rr := doLogs(s, "POST", "secret", `{"project":"p","message":"a"}`, nil); rr.Code != http.StatusNoContent {
 		t.Fatalf("first: want 204 got %d", rr.Code)
 	}
-	if rr := doLogs(s, "POST", "secret", `{"project":"p","message":"b"}`, nil); rr.Code != http.StatusServiceUnavailable {
+	rr := doLogs(s, "POST", "secret", `{"project":"p","message":"b"}`, nil)
+	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("overflow: want 503 got %d", rr.Code)
+	}
+	if rr.Header().Get("Retry-After") == "" {
+		t.Fatal("buffer-full 503 must carry Retry-After")
 	}
 	if s.m.dropped.Load() == 0 {
 		t.Fatal("expected dropped metric > 0")
@@ -369,6 +373,13 @@ func TestClientIPTrustedProxies(t *testing.T) {
 	s.cfg.trustedProxies = tp
 	if got := s.clientIP(req); got != "1.2.3.4" {
 		t.Fatalf("trusted proxy XFF must be used, got %q", got)
+	}
+
+	// The chain is read right to left: the leftmost entry is client-supplied,
+	// the rightmost untrusted one is what the last known proxy actually saw.
+	req.Header.Set("X-Forwarded-For", "203.0.113.9, 198.51.100.7")
+	if got := s.clientIP(req); got != "198.51.100.7" {
+		t.Fatalf("spoofed leftmost entry must lose to the proxy-appended one, got %q", got)
 	}
 }
 

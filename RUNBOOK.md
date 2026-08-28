@@ -21,6 +21,24 @@ spool (`gw-spool` volume) and **are replayed automatically** once it recovers (r
 batch quarantined as `.bad`) and in `logden_logs_rejected_total` (rate limit, admission
 control, bad token, invalid event) — clients do not retry, so both count.
 
+ClickHouse's own complaints are queryable too: `text_log` is deliberately enabled at
+`warning` (stock ClickHouse ships it off), and it is the only durable copy once the
+container's stderr has rotated (10 MB × 3). Run it as `default` — `reader` has no grant
+on that table:
+```bash
+docker compose exec clickhouse clickhouse-client -q \
+  "SELECT event_time, level, message FROM system.text_log
+   WHERE event_time > now()-INTERVAL 1 HOUR ORDER BY event_time DESC LIMIT 50"
+```
+
+**"Container is unhealthy".** The ClickHouse healthcheck is
+`wget --spider http://clickhouse:8123/ping` aimed at the docker-network name — deliberately
+not a `clickhouse-client` probe, because from that address `default` is rejected by
+`docker/clickhouse-access.xml` (loopback only) and the container would never turn healthy.
+`/ping` needs no auth. Cold-start budget: `start_period` 60 s, then 30 attempts at 5 s;
+failures inside `start_period` don't count against `retries`. Still red past that is a real
+failure, not a slow boot — read the logs above rather than raising `retries`.
+
 ## Rotating the shared token (no downtime)
 
 `LOG_TOKEN` accepts several comma-separated tokens.
@@ -34,6 +52,39 @@ docker compose up -d gateway
 ```
 Bare metal: edit `/etc/logden.env` + `systemctl restart logden`.
 
+Both restarts are graceful: the gateway drains its buffer to ClickHouse or the spool
+before exiting. The budget is 15 s of HTTP shutdown + one insert that was already in
+flight (15 s, it keeps its pre-drain timeout) + `ceil(BUFFER_SIZE/BATCH_SIZE) × 3 s`
+≈ 42 s at the defaults, which is why `stop_grace_period` (docker-compose.yml) and
+`TimeoutStopSec` (deploy/logden.service) are both 60 s. Raising `BUFFER_SIZE` or
+lowering `BATCH_SIZE` lengthens the drain by 3 s per extra full batch — recompute both
+deadlines, or SIGKILL lands mid-drain and the buffered events never reach the spool.
+
+## Rotating the ClickHouse passwords
+
+`CREATE USER OR REPLACE` in both init paths makes a re-run the supported rotation.
+Docker (the users live in the `ch-data` volume, so initdb will not run again):
+
+```bash
+NEW_WRITER=$(openssl rand -hex 32)
+docker compose exec -e CH_WRITER_PASSWORD="$NEW_WRITER" clickhouse \
+  /docker-entrypoint-initdb.d/20-users.sh
+# then set CH_WRITER_PASSWORD=$NEW_WRITER in .env and: docker compose up -d gateway
+```
+The script recreates **both** accounts every time. Only the writer is overridden above;
+the reader is re-created from the `CH_READER_PASSWORD` the container was started with, so
+if you had changed it in `.env` without recreating the container, that edit is what gets
+rolled back — pass `-e CH_READER_PASSWORD=…` explicitly whenever the two might disagree.
+
+Bare metal: re-run `clickhouse/users.sql` through the `sed` hash recipe in README
+("Installation without Docker"). Either way `OR REPLACE` drops the user together with
+its grants — everything these two accounts need is re-granted by the same file, but a
+grant added by hand elsewhere is lost and must be re-applied.
+
+After rotating `writer`, the gateway needs the new `CLICKHOUSE_PASSWORD`
+(`CH_WRITER_PASSWORD` in `.env`) and a restart, or every insert fails to authenticate
+and the spool starts filling.
+
 ## Changing retention
 
 `schema.sql` (`INTERVAL 30 DAY`) — for NEW installs only. On a live table:
@@ -41,6 +92,12 @@ Bare metal: edit `/etc/logden.env` + `systemctl restart logden`.
 docker compose exec clickhouse clickhouse-client -q \
   "ALTER TABLE logs.logs MODIFY TTL toDateTime(timestamp) + INTERVAL 14 DAY DELETE"
 ```
+Move the gateway's `RETENTION` in the same step (`.env` → `docker compose up -d
+gateway`, or `/etc/logden.env` → `systemctl restart logden`). It is the window
+the gateway accepts client timestamps in, not a second TTL: an event older than
+`RETENTION` is still stored, but under the ingest time instead of its own. Watch
+`logden_logs_restamped_total{reason="too_old"}` after the change — a rising
+counter means senders are backfilling outside the new window.
 
 ## Disk full
 
@@ -51,7 +108,11 @@ docker compose exec clickhouse clickhouse-client -q \
 # drop the oldest partition:
 docker compose exec clickhouse clickhouse-client -q "ALTER TABLE logs.logs DROP PARTITION '20260101'"
 ```
-CH system logs are capped at 3 days (`config.d/system-logs.xml`).
+CH system logs are capped at 3 days (`config.d/system-logs.xml`), and the two metric logs
+are sampled every 30 s rather than every second — same number of parts per day, ~30× fewer
+rows in them. `query_thread_log`, `query_views_log`, `trace_log` and `session_log` are off
+entirely; `text_log` is deliberately on at `warning`, where a healthy server writes nothing,
+because container stderr is capped at 10 MB × 3 and rotates an incident away.
 The `ClickHouseDiskLow` alert (`deploy/alerts.yml`) fires below 2 GB free on the
 data path — don't wait for a 100% full disk, ClickHouse stops merging well before that.
 Other disk consumers to check: in-volume backups (`deploy/backup.sh` keeps
@@ -64,6 +125,9 @@ gateway spool (capped at `SPOOL_MAX_BYTES`, 256 MB by default).
 ch() { docker compose exec -T clickhouse clickhouse-client -q "$1"; }
 ch "SELECT count() FROM logs.logs WHERE timestamp > now()-INTERVAL 1 HOUR"     # throughput
 ch "SELECT formatReadableSize(value) FROM system.asynchronous_metrics WHERE metric='MemoryResident'"
+   # ^ async metrics refresh every 30s (asynchronous_metrics_update_period_s), so this
+   #   spot check can lag half a minute behind an RSS climb. The alerts are unaffected:
+   #   both ClickHouse rules use for: 10m or longer.
 ch "SELECT status, count() FROM system.asynchronous_insert_log WHERE event_time > now()-INTERVAL 1 HOUR GROUP BY status"
 curl -s localhost:8080/metrics | grep -E 'logden_(logs|spool|clickhouse)'
 ```
@@ -116,6 +180,13 @@ toward `SPOOL_MAX_BYTES` until removed, squeezing out fresh batches.
 ## Scaling
 
 - **Vertically:** raise `mem_limit` and `max_server_memory_usage` in proportion to RAM.
+- **Stop deadlines are load-bearing, not padding.** Both services get
+  `stop_grace_period: 60s`. Compose stops in reverse dependency order, so the gateway
+  drains into a live ClickHouse and only then does ClickHouse see SIGTERM — at which point
+  it still has to flush the async-insert queue and the system-log buffers (up to a 30 s
+  flush interval) and unwind a merge that can cover
+  `max_bytes_to_merge_at_max_space_in_pool` = 1 GiB on one vCPU. Docker's default 10 s
+  SIGKILLs through all of that.
 - **Stateless gateway:** scales horizontally behind an L4/L7 load balancer (one shared token);
   each instance has its own spool — no data is lost.
 - **Bottleneck** is write throughput: grow `BATCH_SIZE`/`async_insert_max_data_size`.

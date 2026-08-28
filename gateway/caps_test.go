@@ -612,3 +612,62 @@ func TestMetricsRenderCaps(t *testing.T) {
 		}
 	}
 }
+
+// The budget must stay charged for the WHOLE flush, not just while the batch sits
+// in the channel: buffer and in-flight batch share BUFFER_MAX_BYTES, so releasing
+// the bytes before the insert returns lets a fresh 32MiB of events be admitted
+// next to an 8MiB batch that is still in memory — the OOM the byte caps exist to
+// prevent. TestBufferBytesReleasedAfterFlush cannot see this: it only checks the
+// budget once the insert has already landed.
+func TestBufferBytesHeldUntilFlushCompletes(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		select {
+		case entered <- struct{}{}:
+		default: // a later insert (the drain) must not block on an unread signal
+		}
+		select {
+		case <-release:
+		case <-time.After(5 * time.Second):
+			// A regression that never reaches the release must fail the test, not
+			// wedge the suite.
+			t.Error("insert stub was never released")
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	cfg := testConfig()
+	cfg.chBaseURL = stub.URL
+	cfg.batchSize = 1
+	cfg.flushInterval = 10 * time.Millisecond
+	// Tight on purpose: one ~90-byte row fits, a second does not while the first
+	// is still charged. Widening testConfig's rows would need this raised.
+	cfg.bufferMaxBytes = 150
+	s := newServer(cfg)
+	s.ingest.start()
+	// Registered in this order so the LIFO unwind releases the stub BEFORE the
+	// drain and before the server is closed; either would otherwise block.
+	defer stub.Close()
+	defer s.ingest.stop()
+	defer close(release)
+
+	if rr := doLogs(s, "POST", "secret", `{"project":"p","message":"a"}`, nil); rr.Code != http.StatusNoContent {
+		t.Fatalf("first: want 204 got %d", rr.Code)
+	}
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the worker never started the insert")
+	}
+
+	if got := s.ingest.depthBytes(); got <= 0 {
+		t.Fatalf("depthBytes = %d while the insert is in flight: the batch left the budget before the flush finished", got)
+	}
+	// The user-visible half of the same invariant: the in-flight batch keeps the
+	// gateway shedding instead of admitting a second budget's worth of events.
+	if rr := doLogs(s, "POST", "secret", `{"project":"p","message":"b"}`, nil); rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("second: want 503 while the batch is in flight, got %d", rr.Code)
+	}
+}

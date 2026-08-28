@@ -4,19 +4,47 @@
   and grow unboundedly, and on a 1 GB box this is the main invisible consumer
   of disk and memory (background merges). Logs that are heavy and useless for
   this project are disabled (remove="1"); the rest are kept for 3 days.
+
+  Retention is only half of it. The two metric logs are *sampled* once a second
+  by default, and on this profile that is the larger cost: asynchronous_metric_log
+  writes one row per async metric per tick (a few hundred metrics, so tens of
+  millions of rows a day) and metric_log writes one ~1500-column row per tick,
+  and every bit of it then has to be merged on a single vCPU. Both are slowed to
+  30s below. The flush intervals are left alone on purpose, so the number of
+  parts written per day does not change at all - each part simply carries ~30x
+  fewer rows.
 -->
 <clickhouse>
+    <!-- This also decides how fresh system.asynchronous_metrics and the async
+         series on the :9363 Prometheus endpoint are, so it is a resolution knob
+         and not only a cost one: values become up to 30s old. Prometheus scrapes
+         every 15s (deploy/prometheus.yml.example) and both ClickHouse alerts fire
+         on `for: 10m` or longer (deploy/alerts.yml), so no alert loses signal;
+         the one visible cost is that RUNBOOK's MemoryResident spot check can lag
+         half a minute behind an RSS climb. -->
+    <asynchronous_metrics_update_period_s>30</asynchronous_metrics_update_period_s>
+
+    <!-- 30s flush intervals rather than the 7.5s default: a flush that has rows
+         in it writes a part, and here these tables feed themselves (every system
+         log flush and every merge is another part_log row), so the default turns
+         into a steady drip of tiny parts to merge. The price is losing up to 30s
+         of system-log rows if the server is SIGKILLed. -->
     <query_log>
         <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
         <flush_interval_milliseconds>30000</flush_interval_milliseconds>
     </query_log>
     <part_log>
         <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+        <flush_interval_milliseconds>30000</flush_interval_milliseconds>
     </part_log>
     <metric_log>
         <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+        <!-- The sampling rate. flush_interval only batches what was sampled, so
+             without this the row count stays at one wide row per second. -->
+        <collect_interval_milliseconds>30000</collect_interval_milliseconds>
         <flush_interval_milliseconds>30000</flush_interval_milliseconds>
     </metric_log>
+    <!-- Row rate follows asynchronous_metrics_update_period_s above. -->
     <asynchronous_metric_log>
         <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
         <flush_interval_milliseconds>60000</flush_interval_milliseconds>
@@ -24,7 +52,17 @@
     <!-- keep the async insert log: it reveals SILENT log loss -->
     <asynchronous_insert_log>
         <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+        <flush_interval_milliseconds>30000</flush_interval_milliseconds>
     </asynchronous_insert_log>
+    <!-- Deliberately on, unlike stock ClickHouse, which ships text_log disabled.
+         The bargain: at <level>warning</level> a healthy server writes no rows
+         at all, and when something does go wrong this is the only durable copy
+         of the server's own complaints - the container's stderr is capped at
+         10m x 3 files (x-logging in docker-compose.yml) and rotates the incident
+         away, and this stack has nowhere else to ship ClickHouse's own logs. It
+         also makes them answerable in SQL next to logs.logs, which is what
+         RUNBOOK's diagnostic steps reach for. Lowering <level> to information or
+         below cancels the bargain: that is continuous write and merge load. -->
     <text_log>
         <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
         <level>warning</level>

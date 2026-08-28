@@ -4,6 +4,11 @@ on:
   push:
     branches: [ main ]
   pull_request:
+  # Called by release.yml. A tag push (refs/tags/v*) matches neither trigger
+  # above, so without this the published image would be the first build of that
+  # commit anyone ever tested. Do not add `tags:` to the push trigger as well:
+  # with the call in place that only runs the suite twice on the same commit.
+  workflow_call:
 
 permissions:
   contents: read
@@ -25,7 +30,15 @@ jobs:
         run: go vet ./...
       - name: staticcheck
         working-directory: gateway
-        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+        # Pinned, never @latest: an unpinned `go run` makes every CI run execute
+        # whatever third-party code the network serves that minute, so the same
+        # commit can go red without anyone changing it. v0.7.0 is the module
+        # version of staticcheck 2026.1 - the calendar tags are not semver, and
+        # only a semver version is checksum-verified. `go run pkg@version` still
+        # touches no go.mod, so the zero-dependency rule holds. Dependabot
+        # cannot see this pin: bump it by hand, together with Makefile's lint
+        # target, which must stay on the same version.
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
       - name: test (race + coverage)
         working-directory: gateway
         run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
@@ -44,6 +57,20 @@ jobs:
           if [ -n "$(gofmt -l .)" ]; then echo "unformatted:"; gofmt -l .; exit 1; fi
           go vet ./...
           go build -o /dev/null ./...
+      - name: govulncheck (all three modules)
+        # The Go toolchain and stdlib are the entire dependency surface (no
+        # third-party imports by policy), so a stdlib/toolchain advisory is the
+        # only dependency vulnerability this repo can have - and govulncheck is
+        # the only scanner that reports it. It exits non-zero only on a finding
+        # reachable from the code, so this does not go red on advisories the
+        # gateway never calls into. Pinned for the same reason as staticcheck.
+        # All three modules are scanned: they are independent (no go.work), so
+        # each pins its own Go directive and each ships its own binary.
+        run: |
+          for mod in gateway clients/go tools/loadtest; do
+            echo "== $mod"
+            (cd "$mod" && go run golang.org/x/vuln/cmd/govulncheck@v1.2.0 ./...)
+          done
 
   integration:
     runs-on: ubuntu-latest
@@ -74,7 +101,28 @@ jobs:
           CLICKHOUSE_URL: http://localhost:8123
           CLICKHOUSE_USER: default
           CLICKHOUSE_PASSWORD: ci
-        run: go test -tags=integration ./...
+        # The tagged tests t.Skip themselves when CLICKHOUSE_URL is unset, and
+        # `go test` reports an all-skipped package as ok - so a service
+        # container that never came up used to yield a green build that tested
+        # nothing at all. Assert from the verbose log that a TestIntegration*
+        # really ran and that none of them skipped. Every integration test must
+        # therefore keep the TestIntegration prefix; the check is scoped to that
+        # prefix because the same command also runs the unit tests, one of which
+        # (the opt-in memory probe) skips by design. pipefail is not a runner
+        # default and tee always succeeds, so without it a failing `go test`
+        # would reach the greps instead of stopping the step.
+        run: |
+          set -eo pipefail
+          go test -tags=integration -v ./... 2>&1 | tee "$RUNNER_TEMP/integration.log"
+          log="$RUNNER_TEMP/integration.log"
+          if grep -q '^--- SKIP: TestIntegration' "$log"; then
+            echo "::error::integration tests skipped - ClickHouse was not reachable"
+            exit 1
+          fi
+          if ! grep -q '^--- PASS: TestIntegration' "$log"; then
+            echo "::error::no TestIntegration* ran - the tagged suite did not build or matched nothing"
+            exit 1
+          fi
 
   docker:
     runs-on: ubuntu-latest
@@ -82,6 +130,19 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: build gateway image
         run: docker build -t logden ./gateway
+      - name: compose files are valid
+        # `config` resolves the full compose schema plus the ${VAR:?...}
+        # interpolation the stack requires, so a typo in the file the operator
+        # actually deploys fails here instead of on the VPS. The dummy secrets
+        # only need to be non-empty. The second call parses the override
+        # example, which nothing else in CI reads.
+        env:
+          LOG_TOKEN: ci
+          CH_WRITER_PASSWORD: ci
+          CH_READER_PASSWORD: ci
+        run: |
+          docker compose config -q
+          docker compose -f docker-compose.yml -f docker-compose.override.yml.example config -q
 
   lint-extra:
     runs-on: ubuntu-latest
@@ -99,14 +160,43 @@ jobs:
         with:
           config_file: .yamllint.yml
           strict: true
-      # The Node and Python clients have no test runner (zero-dependency by
-      # policy); a syntax check still catches a broken client before release.
-      # They live here, not in a job of their own, so they are covered by a
-      # branch-protection context that is already required.
-      - name: node client parses
-        run: node --check clients/node/logden.mjs
-      - name: python client compiles
-        run: python3 -m py_compile clients/python/logden_client.py
+      # The Node and Python clients ship stdlib test runners, so CI runs the
+      # real suites; a passing run also proves both modules parse, which is all
+      # the previous `node --check` / `py_compile` steps did. They live here,
+      # not in a job of their own, so they are covered by a branch-protection
+      # context that is already required.
+      - name: node client tests
+        # A glob, not `node --test clients/node/`: Node >= 26 rejects the
+        # directory form (it tries to load the directory as a module), and
+        # adding a package.json to make it work would sweep in logden.mjs
+        # itself, which defines no tests and would pass vacuously.
+        #
+        # `node --test` exits 0 when the pattern matches no file, so a renamed
+        # or relocated suite would leave this step green having run nothing -
+        # the same silent pass the integration job guards against above. The
+        # TAP reporter is pinned because the default flips between tap and spec
+        # by Node version and TTY, and the assertion has to read a summary line
+        # that does not move under it.
+        run: |
+          set -eo pipefail
+          node --test --test-reporter=tap 'clients/node/**/*.test.mjs' \
+            | tee "$RUNNER_TEMP/node-tests.tap"
+          if ! grep -qE '^# pass [1-9]' "$RUNNER_TEMP/node-tests.tap"; then
+            echo "::error::no node client tests ran - the glob matched nothing"
+            exit 1
+          fi
+      - name: python client tests
+        working-directory: clients/python
+        # Bare `python3 -m unittest` is discovery, and discovery that matches
+        # nothing still prints OK and exits 0 - the same hole as the Node step.
+        # unittest writes its summary to stderr, hence the redirect.
+        run: |
+          set -eo pipefail
+          python3 -m unittest 2>&1 | tee "$RUNNER_TEMP/python-tests.log"
+          if ! grep -qE '^Ran [1-9][0-9]* tests?' "$RUNNER_TEMP/python-tests.log"; then
+            echo "::error::no python client tests ran - discovery matched nothing"
+            exit 1
+          fi
       - name: php example parses
         run: php -l examples/LoggerGatewayHandler.php
       - name: promtool check rules
@@ -114,3 +204,12 @@ jobs:
           docker run --rm -v "$PWD/deploy:/d:ro" --entrypoint promtool
           prom/prometheus:v3.12.0@sha256:69f5241418838263316593f7274a304b095c40bcf22e57272865da91bd60a8ac
           check rules /d/alerts.yml
+      - name: promtool check config
+        # rule_files paths resolve relative to the config file's own directory,
+        # so mounting deploy/ as /d lets the example reach alerts.yml with no
+        # rewriting. This is the only check the shipped scrape config gets:
+        # yamllint skips it, since its name does not end in .yml.
+        run: >-
+          docker run --rm -v "$PWD/deploy:/d:ro" --entrypoint promtool
+          prom/prometheus:v3.12.0@sha256:69f5241418838263316593f7274a304b095c40bcf22e57272865da91bd60a8ac
+          check config /d/prometheus.yml.example

@@ -1,6 +1,18 @@
 # secrets / local config
+# *.env covers every filled-in env file (.env, deploy/logden.env, prod.env);
+# the tracked *.env.example templates keep a different suffix, and the negation
+# guarantees it stays that way.
 .env
+*.env
+!*.env.example
 docker-compose.override.yml
+# Local copies carrying real passwords: the tracked clickhouse/users.sql ships
+# sha256_hash sentinels ClickHouse refuses outright, so keep the substituted
+# copy in users.local.sql rather than editing the template in place.
+*.local.sql
+# Files behind the *_FILE secret pattern (LOG_TOKEN_FILE, CLICKHOUSE_PASSWORD_FILE,
+# METRICS_TOKEN_FILE) when they are kept next to the checkout.
+secrets/
 
 # built gateway binary and coverage
 /gateway/logden

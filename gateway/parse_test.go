@@ -97,11 +97,12 @@ func TestRowSerializationStaysWithinBudget(t *testing.T) {
 		// Raw < > & : with HTML escaping on, each becomes a 6-byte \u00xx.
 		{"html characters", strings.Repeat("<&>", 200), 2},
 		{"url with ampersands", strings.Repeat("?a=1&b=2 ", 100), 2},
-		// Invalid UTF-8: the decoder turns each bad byte in `message` into a
-		// 3-byte U+FFFD (unavoidable), while `context` is sanitized run-wise, so
-		// the row stays within 3x. Without the sanitizer the context alone
-		// re-encodes at 6 bytes per byte and blows past it.
-		{"invalid utf-8", strings.Repeat("\xff\xfe", 100), 3},
+		// Invalid UTF-8: parseBatch now sanitizes the whole element run-wise
+		// before the decoder sees it, so both `message` and `context` collapse a
+		// run to one U+FFFD and the row obeys the same 2x budget as the rest.
+		// Unsanitized, the decoder alone re-encoded `message` at 3 bytes per bad
+		// byte and the context encoder at 6.
+		{"invalid utf-8", strings.Repeat("\xff\xfe", 100), 2},
 	}
 	s := newServer(testConfig())
 	for _, c := range cases {

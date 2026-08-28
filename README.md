@@ -75,16 +75,51 @@ Content-Encoding: gzip            (optional)
 ```
 
 - **Batch:** the body may be a JSON array `[ {...}, {...} ]` or NDJSON (one object per line).
+- **Levels** are PSR-3: `debug`, `info`, `notice`, `warning`, `error`, `critical`, `alert`,
+  `emergency`. Five aliases are normalized — `warn`→`warning`, `err`→`error`,
+  `fatal`→`critical`, `panic`→`emergency`, `trace`→`debug` — and anything else becomes `info`.
+- **Size handling differs by field:** an oversized `message` is **truncated** (byte-wise, with a
+  `…[truncated]` suffix), an oversized `context` is **discarded** and replaced by
+  `{"_truncated":true,"_orig_bytes":N}` — both counted in
+  `logden_logs_truncated_total{field}`. A `context` that is not valid JSON is replaced by
+  `{"_invalid_json":true}` (the event is still stored, and this one is not counted).
 - **Partial accept:** invalid batch elements are skipped (the
   `logden_logs_rejected_total{reason="invalid_event"}` metric), valid ones are accepted; the whole
   batch is rejected (`400`) only if none are valid — that request is counted once as
   `reason="all_invalid"`.
 - **Event time:** a missing or unusable `timestamp` is stamped by the gateway when the event is
   accepted, not when the row reaches ClickHouse — a batch replayed from the spool after an outage
-  keeps the time it actually happened.
-- Response: `204 No Content`. Errors: `400` (validation), `401` (token), `405` (method),
-  `413` (body over `MAX_BODY_BYTES` or more than `MAX_BATCH_EVENTS` events),
-  `429` (rate limit), `503` + `Retry-After` (buffer full, or admission control shedding).
+  keeps the time it actually happened. A client time more than 5 minutes in the future or older
+  than `RETENTION` is discarded the same way and counted in
+  `logden_logs_restamped_total{reason}`.
+- Response: `204 No Content` (returned after the event enters the buffer, not after the insert).
+- **Error bodies are JSON:** every non-`204` answer from `/logs` is `{"error":"<reason>"}`
+  with `Content-Type: application/json; charset=utf-8`. The reason is a closed vocabulary,
+  so a sender can tell an invalid project name from an oversized body without access to
+  `/metrics`:
+
+  | reason | status | meaning |
+  |---|---|---|
+  | `method` | `405` | not `POST` (the answer carries `Allow: POST`) |
+  | `auth` | `401` | missing or unknown token (`WWW-Authenticate: Bearer`) |
+  | `empty` | `400` | body held no events |
+  | `bad_json` | `400` | malformed JSON, a truncated array, or trailing garbage |
+  | `bad_gzip` | `400` | `Content-Encoding: gzip` that does not decompress |
+  | `read_error` | `400` | the body could not be read to the end |
+  | `all_invalid` | `400` | every event in the batch failed validation |
+  | `too_large` | `413` | body over `MAX_BODY_BYTES` (checked on the wire *and* on the gunzipped stream) |
+  | `too_many_events` | `413` | more than `MAX_BATCH_EVENTS` events |
+  | `rate_limited` | `429` | `RATE_LIMIT_RPS` bucket empty (`Retry-After: 1`) |
+  | `overloaded` | `503` | admission control shedding, `MAX_INFLIGHT_BODY_BYTES` (`Retry-After: 1`) |
+  | `buffer_full` | `503` | in-memory buffer full (`Retry-After: 1`) |
+
+  Every reason above except `buffer_full` also labels `logden_logs_rejected_total`;
+  `buffer_full` is response-only, because a buffer-full drop is counted by
+  `logden_logs_dropped_total` and `deploy/alerts.yml` keys a separate rule on the rejected
+  counter. `invalid_event` is the other way round — a per-event metric label only, never a
+  response body, since a batch with one bad element is still accepted (`204`). Only `/logs`
+  answers JSON; `/healthz`, `/readyz` and `/metrics` keep the plain-text bodies container
+  probes and scrapers already expect.
 - The token can be sent in `Authorization: Bearer <…>` or in the `X-Log-Token: <…>` header.
 - `source_ip` is set by the gateway (see `TRUSTED_PROXIES`).
 
@@ -107,9 +142,15 @@ docker compose up -d --build
 
 Without building from source — use the prebuilt image from ghcr (published on release tag `v*`):
 ```bash
-# in .env: GATEWAY_IMAGE=ghcr.io/ginkida/logden:0.3.0
+# in .env: GATEWAY_IMAGE=ghcr.io/ginkida/logden:0.4.0
 docker compose pull gateway && docker compose up -d
 ```
+
+On the first start of an empty `ch-data` volume ClickHouse runs the schema and creates the
+two users, and its healthcheck (`wget --spider http://clickhouse:8123/ping`) stays red for
+the whole of that — up to the 60 s `start_period`. The gateway waits on
+`depends_on: service_healthy`, so `docker compose ps` until both containers say `healthy`
+before sending anything. A warm restart passes on the first probe.
 
 Check:
 ```bash
@@ -136,21 +177,44 @@ deliberately set `GATEWAY_BIND=0.0.0.0`. ClickHouse is not published externally 
    users for `users.sql` and locks it to loopback). Restart, then:
    ```bash
    clickhouse-client --multiquery < clickhouse/schema.sql
-   # change the passwords in users.sql:
-   clickhouse-client --multiquery < clickhouse/users.sql
    ```
+   `clickhouse/users.sql` is tracked and holds **no usable credential**: the two
+   passwords are `__WRITER_HASH__` / `__READER_HASH__` sentinels, and ClickHouse
+   refuses a `sha256_hash` that is not 64 hex characters, so piping the file in
+   as-is aborts on the first statement. Substitute the hashes from the
+   environment instead — no plaintext reaches disk or the shell history:
+   ```bash
+   pwhash() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
+   # no sha256sum (BSD/macOS)?  openssl dgst -sha256 -r | cut -d' ' -f1
+   set -a; . ./.env; set +a
+   sed -e "s/__WRITER_HASH__/$(pwhash "$CH_WRITER_PASSWORD")/" \
+       -e "s/__READER_HASH__/$(pwhash "$CH_READER_PASSWORD")/" clickhouse/users.sql \
+     | clickhouse-client --multiquery
+   ```
+   If you would rather keep an edited copy, copy it to
+   `clickhouse/users.local.sql` and edit that — `.gitignore` covers `*.local.sql`
+   so real credentials cannot be committed. Never edit the tracked file in place.
+   The statements are `CREATE USER OR REPLACE`, so re-running this is also how a
+   password is rotated (it drops hand-added grants; everything the two accounts
+   need is re-granted by the file itself).
 2. **Gateway** — `make build`, put the binary in `/usr/local/bin/`, configure
    `deploy/logden.env.example` → `/etc/logden.env`, install
    `deploy/logden.service` and `systemctl enable --now logden`.
 
 ## Clients
 
-Ready-made modules with batching — `clients/` (Go package, Python, Node).
+Ready-made modules with batching — `clients/` (Go package, Python, Node), documented
+together in [clients/README.md](clients/README.md).
 **bash** — `examples/curl.sh`. **Laravel** — `examples/LoggerGatewayHandler.php`.
 
 Clients are deliberately thin: they **do not retry and do not spool**; if the gateway is
-unavailable the event (in batch mode — the whole batch, silently) is lost. All delivery
-reliability lives on the gateway → ClickHouse leg.
+unavailable the event is lost. All delivery reliability lives on the gateway → ClickHouse
+leg, where it can be durable. What the clients do is make the loss visible — batch mode
+never sends on the caller's stack, its buffer is bounded (oldest dropped first, counted and
+reported), and every background failure goes to an error sink whose default is *not* silence
+(stdlib `log` in Go, `console.error` in Node, one stderr line in Python).
+
+No library is required, though — the contract is one POST. Raw examples:
 
 **Node.js**
 ```js
@@ -176,7 +240,7 @@ requests.post(f"{os.environ['LOG_GATEWAY_URL']}/logs",
 |----------------------|--------------------------|-------------------------------------------------|
 | `LOG_TOKEN`          | —                        | shared token(s), comma-separated; required       |
 | `LISTEN_ADDR`        | `:8080`                  | listen address                                  |
-| `CLICKHOUSE_URL`     | `http://127.0.0.1:8123`  | ClickHouse address; scheme + host only, a path is refused at startup |
+| `CLICKHOUSE_URL`     | `http://127.0.0.1:8123`  | ClickHouse address; `scheme://host[:port]` only — a path, query, fragment or embedded credentials are refused at startup |
 | `CLICKHOUSE_USER`    | `writer`                 | user for inserts                                |
 | `CLICKHOUSE_PASSWORD`| —                        | password (or `*_FILE`)                          |
 | `BATCH_SIZE`         | `500`                    | batch size                                      |
@@ -198,13 +262,27 @@ requests.post(f"{os.environ['LOG_GATEWAY_URL']}/logs",
 | `MAX_BODY_BYTES`     | `4194304`                | whole request body cap (source of 413)          |
 | `MAX_BATCH_EVENTS`   | `1000`                   | maximum events per request                      |
 | `SPOOL_MAX_FILES`    | `1000`                   | cap on the number of batches in the spool        |
-| `RETENTION`          | `720h`                   | reject client timestamps older than (≈ TTL)     |
+| `RETENTION`          | `720h`                   | discard client timestamps older than (≈ TTL)    |
 | `CLICKHOUSE_DB` / `_TABLE` | `logs` / `logs`    | database/table name                             |
 
 The source of truth for config is `loadConfig` in `gateway/main.go`.
 Secrets can be supplied via file: `LOG_TOKEN_FILE`, `CLICKHOUSE_PASSWORD_FILE`,
 `METRICS_TOKEN_FILE` (the file wins over the plain variable, and is trimmed).
 `LOG_TOKEN` is split on commas and newlines only — a token may contain spaces.
+
+Two things worth knowing before you tune anything:
+
+- **A value that does not parse is silently ignored** and the default is used
+  instead — a typo in a duration or a number will not stop the gateway, it will just
+  not take effect. Check `/version` and the startup log line rather than assuming.
+- **The byte caps are validated against each other at startup**, and a violation is a
+  refusal to start (exit 2), not a warning: a non-zero `BUFFER_MAX_BYTES` must be
+  `>= 2 × MAX_BODY_BYTES` (a serialized row is larger than the raw body it came from)
+  and a non-zero `MAX_INFLIGHT_BODY_BYTES` must be `>= MAX_BODY_BYTES` (one max-size
+  request has to fit). So raising `MAX_BODY_BYTES` alone breaks the boot — raise all
+  three together, along with `mem_limit`/`GOMEMLIMIT`. `MAX_BATCH_EVENTS > BUFFER_SIZE`
+  is only a startup *warning*, but it means a full-size client batch can never be
+  accepted, not even on an idle gateway.
 
 ## Analysis
 
@@ -224,12 +302,23 @@ read-only `reader` user. Full-text search — via `hasToken(message, …)`
 `logden_buffer_capacity_bytes`, `logden_inflight_body_bytes`,
 `logden_inflight_body_capacity_bytes`, `logden_process_start_time_seconds`,
 `logden_logs_rejected_total{reason}`, `logden_logs_truncated_total{field}`,
-`logden_http_requests_total{path,code}`,
+`logden_logs_restamped_total{reason}`, `logden_http_requests_total{path,code}`,
+`logden_project_logs_received_total{project}`,
+`logden_project_logs_dropped_total{project}`, `logden_project_labels_tracked`,
+`logden_project_labels_capacity`,
 `logden_clickhouse_insert_duration_seconds` (histogram), `logden_build_info`.
+The per-project counters are capped at 64 distinct projects: `project` arrives
+over the wire, so an unbounded label set would be a scrape-time OOM vector.
+Past the cap a new project counts under `project="<overflow>"` — the charset
+`project` is validated against cannot produce that name, so nothing can hide
+inside the bucket — and `logden_project_labels_tracked` vs
+`logden_project_labels_capacity` shows when that is happening.
 ClickHouse has its built-in prometheus endpoint enabled on `:9363` (not published externally).
-Ready-made alert rules — `deploy/alerts.yml` (drops, CH unavailability, spool growth
-by files and bytes, buffer fill, insert latency, restart loop, ClickHouse memory and
-free disk); an example Prometheus scrape config — `deploy/prometheus.yml.example`.
+Ready-made alert rules — `deploy/alerts.yml` (gateway target down, drops, insert failures,
+shed traffic, CH unavailability, spool growth by files and bytes, buffer fill by events and
+by bytes, insert latency, restart loop, ClickHouse memory and free disk, a per-project dead
+man's switch, label-cap saturation and timestamp rewrites); an example Prometheus scrape
+config — `deploy/prometheus.yml.example`. Renaming a metric breaks these rules.
 
 ## Production
 

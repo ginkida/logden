@@ -42,11 +42,11 @@ docker compose up -d --build
 ```
 
 or use the prebuilt image (no Go toolchain, no build; check
-<https://github.com/ginkida/logden/releases> for the latest tag — `0.3.0` below
+<https://github.com/ginkida/logden/releases> for the latest tag — `0.4.0` below
 is an example):
 
 ```bash
-sed -i.bak "s|^GATEWAY_IMAGE=.*|GATEWAY_IMAGE=ghcr.io/ginkida/logden:0.3.0|" .env && rm -f .env.bak
+sed -i.bak "s|^GATEWAY_IMAGE=.*|GATEWAY_IMAGE=ghcr.io/ginkida/logden:0.4.0|" .env && rm -f .env.bak
 docker compose pull gateway && docker compose up -d
 ```
 
@@ -54,7 +54,7 @@ docker compose pull gateway && docker compose up -d
 
 | # | Command | Expected |
 |---|---------|----------|
-| 1 | `docker compose ps` | both containers `healthy` (ClickHouse needs ~15 s on first start) |
+| 1 | `docker compose ps` | both containers `healthy`. On the first start of an empty volume ClickHouse runs schema + user init and its `/ping` healthcheck stays red throughout — allow the full 60 s `start_period` before calling it a failure; the gateway waits on `service_healthy` |
 | 2 | `curl -fsS localhost:8080/healthz` | `ok` |
 | 3 | `curl -fsS localhost:8080/readyz` | `ready` (503 means ClickHouse is not up yet — wait and retry) |
 | 4 | see below | `204`, then one row returned |
@@ -91,28 +91,46 @@ per line). Fields per event:
 | Field | Required | Rules |
 |---|---|---|
 | `project` | yes | your application name; `[A-Za-z0-9._-]`, max 64 chars. New projects need no registration — just send. |
-| `message` | yes | non-empty; truncated beyond 64 KiB |
-| `level` | no | normalized (`warn`→`warning`, `err`→`error`, `fatal`→`critical`); unknown → `info` |
-| `context` | no | any JSON object; beyond 64 KiB it is DISCARDED and replaced by `{"_truncated":true,"_orig_bytes":N}` |
+| `message` | yes | non-empty; TRUNCATED beyond 64 KiB (byte-wise, with a `…[truncated]` suffix) |
+| `level` | no | PSR-3: `debug`, `info`, `notice`, `warning`, `error`, `critical`, `alert`, `emergency`. Five aliases normalize: `warn`→`warning`, `err`→`error`, `fatal`→`critical`, `panic`→`emergency`, `trace`→`debug`. Anything else → `info` |
+| `context` | no | any JSON object; beyond 64 KiB it is DISCARDED and replaced by `{"_truncated":true,"_orig_bytes":N}`, and invalid JSON by `{"_invalid_json":true}` |
 | `timestamp` | no | RFC3339 or unix sec/ms; >5 min in the future or older than retention → the gateway's ingest time is used |
 
-Responses: `204` accepted; `400` invalid; `401` bad token; `405` wrong method;
-`413` too large (body > 4 MiB **or** more than 1000 events); `429` rate-limited;
-`503` buffer full **or** admission control shedding (`Retry-After: 1` — retry later).
-Batches are accepted partially: invalid events are skipped, `400` only if every
-event is invalid. Max 1000 events per request.
+Responses: `204` accepted (the event is buffered, not yet inserted). Every error
+carries a JSON body `{"error":"<reason>"}` from a closed vocabulary, so a failing
+send is diagnosable from the response alone:
+
+| reason | status |
+|---|---|
+| `method` (not POST, answer carries `Allow: POST`) | `405` |
+| `auth` (missing/unknown token, `WWW-Authenticate: Bearer`) | `401` |
+| `empty`, `bad_json`, `bad_gzip`, `read_error`, `all_invalid` | `400` |
+| `too_large` (body > 4 MiB), `too_many_events` (> 1000 events) | `413` |
+| `rate_limited` | `429` + `Retry-After: 1` |
+| `overloaded` (admission control), `buffer_full` | `503` + `Retry-After: 1` |
+
+Batches are accepted partially: invalid events are skipped and counted as
+`logden_logs_rejected_total{reason="invalid_event"}` while the request still
+answers `204`; `400 all_invalid` only if every event is invalid. That is why
+`invalid_event` never appears in a response body, and `buffer_full` never appears
+as a metric label (a buffer-full drop is counted by `logden_logs_dropped_total`).
 
 Zero-dependency client libraries with optional batching: `clients/go`,
-`clients/python/logden_client.py`, `clients/node/logden.mjs`; Laravel/Monolog
-example in `examples/LoggerGatewayHandler.php`. Clients do **not** retry —
-delivery reliability (retries, disk spool, replay) lives between the gateway
-and ClickHouse.
+`clients/python/logden_client.py`, `clients/node/logden.mjs` — one contract in
+three spellings, documented in [clients/README.md](clients/README.md) (level
+helpers, a bounded batch buffer that drops the oldest events, an error sink whose
+default is not silence, overridable request caps). Laravel/Monolog example in
+`examples/LoggerGatewayHandler.php`. Clients do **not** retry — delivery
+reliability (retries, disk spool, replay) lives between the gateway and
+ClickHouse.
 
 ## Query logs (read-only SQL)
 
-From the host, through the compose service:
+From the host, through the compose service (`CH_READER_PASSWORD` lives in `.env`
+and nothing else exports it, so load it first):
 
 ```bash
+set -a; . ./.env; set +a   # note: exports every variable from .env into this shell
 docker compose exec clickhouse clickhouse-client \
   --user reader --password "$CH_READER_PASSWORD" \
   -q "SELECT timestamp, project, level, message FROM logs.logs
@@ -144,6 +162,9 @@ Metric signals (prefix `logden_`):
 | `logden_spool_files` growing | ClickHouse is down; gateway spools to disk and will replay automatically | usually self-heals |
 | `logden_clickhouse_reachable` = 0 | ClickHouse unreachable | `docker compose logs clickhouse` |
 | `logden_spool_quarantined_total` > 0 | ClickHouse rejected spooled batches (schema mismatch); files kept as `*.ndjson.bad` | RUNBOOK “Spool: .bad quarantine” |
+| `logden_logs_rejected_total{reason}` rising | requests refused before buffering — the reason label says which (see the table above) | fix the sender, or raise the cap it hit |
+| `logden_logs_restamped_total{reason}` rising | client timestamps out of range; the real event time is being replaced by the ingest time | `future` = fix the sender's clock, `too_old` = raise `RETENTION` |
+| `logden_project_labels_tracked` = `_capacity` | 64 distinct projects reached; new ones fold into `project="<overflow>"` | usually a sender generating a project name per event |
 
 Operational procedures (token rotation without downtime, retention change,
 disk-full recovery, backup/restore): [RUNBOOK.md](RUNBOOK.md). Prometheus alert
@@ -155,14 +176,20 @@ rules: `deploy/alerts.yml`.
   For internet exposure put a TLS reverse proxy in front ([SECURITY.md](SECURITY.md))
   — or set `GATEWAY_BIND=0.0.0.0` deliberately (plain HTTP, token in cleartext).
 - Behind a proxy, set `TRUSTED_PROXIES` to the proxy CIDR, otherwise
-  `source_ip` records the proxy address.
+  `source_ip` records the proxy address. List every hop: the chain is read right
+  to left and stops at the first address that is not a trusted proxy.
 - Set `METRICS_TOKEN`, or `/metrics` is public (the gateway warns at startup).
 - Never publish ClickHouse ports (8123/9000/9363) externally.
 
 All gateway configuration is environment variables only — no config files.
-The full variable list with defaults: `.env.example` (compose) or
-`deploy/logden.env.example` (bare metal / systemd). Source of truth:
-`loadConfig` in `gateway/main.go`.
+Every variable `loadConfig` reads is documented with its default in
+`.env.example` (compose) and `deploy/logden.env.example` (bare metal / systemd);
+in the compose file six of them (`LISTEN_ADDR`, `CLICKHOUSE_URL`,
+`CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`, `SPOOL_DIR`, `GOMEMLIMIT`) are pinned by
+`docker-compose.yml` and appear only in the trailing comment block — setting
+those in `.env` does nothing. A variable that `docker-compose.yml` does not pass
+into the container never reaches the gateway at all. Source of truth for the
+defaults: `loadConfig` in `gateway/main.go`.
 
 ## Develop in this repository
 
@@ -177,6 +204,10 @@ cd gateway && go test -race -run TestInsertPipeline .   # single test
 # integration tests (need a real ClickHouse; silently SKIPPED without CLICKHOUSE_URL):
 cd gateway && CLICKHOUSE_URL=http://localhost:8123 CLICKHOUSE_USER=default \
   CLICKHOUSE_PASSWORD=ci go test -tags=integration ./...
+# client suites — separate modules/runners, none of them in `make test`:
+cd clients/go && go test ./...
+node --test 'clients/node/**/*.test.mjs'
+cd clients/python && python3 -m unittest
 ```
 
 Hard rules (enforced in review and CI):

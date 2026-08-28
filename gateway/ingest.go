@@ -240,6 +240,15 @@ func (ing *ingester) insertWithRetry(body []byte) error {
 	backoff := 200 * time.Millisecond
 	for attempt := 0; attempt <= retries; attempt++ {
 		if attempt > 0 {
+			// Re-read the flag instead of trusting the snapshot above: stop() flips
+			// it while this batch may already be inside the loop, and that batch
+			// would then keep the full retry schedule (~10s at the defaults) even
+			// though the drain promises a single attempt. Straight to the spool —
+			// the remainder has to be durable before stop_grace_period runs out,
+			// otherwise SIGKILL lands mid-drain and the events are lost outright.
+			if ing.draining.Load() {
+				break
+			}
 			ing.m.insertRetries.Add(1)
 			time.Sleep(backoff)
 			if backoff < 5*time.Second {

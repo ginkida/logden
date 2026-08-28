@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -149,5 +151,180 @@ func TestClientIPNoTrustedProxies(t *testing.T) {
 	req.Header.Set("X-Forwarded-For", "1.2.3.4")
 	if got := s.clientIP(req); got != "203.0.113.7" {
 		t.Fatalf("without trusted proxies must use peer, got %q", got)
+	}
+}
+
+// stop() closes the buffer channel under the very mutex enqueue sends on. Closing
+// it anywhere else is a send-on-closed-channel panic for a handler still inside
+// enqueue — which is exactly what an HTTP Shutdown that timed out leaves behind.
+// The window is one instruction wide, so it needs many writers and -race to show.
+func TestStopDuringConcurrentEnqueueDoesNotPanic(t *testing.T) {
+	cfg := testConfig()
+	cfg.bufferSize = 2000
+	cfg.batchSize = 500
+	cfg.flushInterval = 10 * time.Millisecond
+	// chBaseURL is empty and no spool dir is set: every insert fails immediately
+	// and the batch is dropped, so the worker keeps draining without any network.
+	s := newServer(cfg)
+	s.ingest.start()
+
+	const writers = 50
+	var offered, accepted, dropped atomic.Int64
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("enqueue panicked during stop(): %v", r)
+				}
+			}()
+			rows := []row{{Project: "p", Message: "a"}, {Project: "p", Message: "b"}}
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				acc, drop := s.ingest.enqueue(rows, "192.0.2.1")
+				offered.Add(int64(len(rows)))
+				accepted.Add(int64(acc))
+				dropped.Add(int64(drop))
+				// All-or-nothing: a half-accepted batch means the client's retry of
+				// the same request duplicates whatever did get through.
+				if acc != 0 && acc != len(rows) {
+					t.Errorf("enqueue accepted %d of %d rows: the batch was split", acc, len(rows))
+					return
+				}
+			}
+		}()
+	}
+
+	waitFor(t, 5*time.Second, func() bool { return offered.Load() > 500 })
+	s.ingest.stop() // closes the channel while every writer is inside enqueue
+	close(done)
+
+	finished := make(chan struct{})
+	go func() { wg.Wait(); close(finished) }()
+	select {
+	case <-finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("writers did not return after stop()")
+	}
+
+	if accepted.Load() == 0 {
+		t.Fatal("nothing was accepted: the writers never reached the live path")
+	}
+	if dropped.Load() == 0 {
+		t.Fatal("nothing was dropped: the writers never raced the close")
+	}
+	if got := accepted.Load() + dropped.Load(); got != offered.Load() {
+		t.Fatalf("accepted+dropped = %d but %d rows were offered: rows vanished", got, offered.Load())
+	}
+}
+
+// logden_clickhouse_reachable backs two alert rules, and the background loop is
+// the only thing that keeps it current on an idle gateway that nobody probes.
+func TestReadinessLoopUpdatesMetric(t *testing.T) {
+	var healthy atomic.Bool
+	healthy.Store(true)
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if !healthy.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_, _ = io.WriteString(w, "1")
+	}))
+	defer stub.Close()
+
+	cfg := testConfig()
+	cfg.chBaseURL = stub.URL
+	m := newMetrics("", "", "")
+	rc := newReadinessCache(cfg, m, 10*time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		rc.loop(ctx)
+	}()
+
+	// No /readyz request is made anywhere in this test: the loop alone must move
+	// the gauge, in both directions.
+	waitFor(t, 2*time.Second, func() bool { return m.chReachable.Load() == 1 })
+	healthy.Store(false)
+	waitFor(t, 2*time.Second, func() bool { return m.chReachable.Load() == 0 })
+	if !strings.Contains(m.render(), "logden_clickhouse_reachable 0\n") {
+		t.Error("the gauge the alert reads was not rendered as unreachable")
+	}
+
+	cancel()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("loop did not return when its context was cancelled: shutdown would hang")
+	}
+}
+
+// While one probe is in flight every other caller gets the LAST known answer
+// instead of starting its own query. /readyz is unauthenticated, so without the
+// single-flight guard a burst past the TTL becomes one ClickHouse SELECT per
+// request on a box sized for none.
+func TestReadinessServesLastValueWhileProbing(t *testing.T) {
+	var probes atomic.Int64
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if probes.Add(1) > 1 { // the first probe answers at once; the second blocks
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
+			select {
+			case <-release:
+			case <-time.After(5 * time.Second):
+				t.Error("probe stub was never released")
+			}
+		}
+		_, _ = io.WriteString(w, "1")
+	}))
+	defer stub.Close()
+
+	cfg := testConfig()
+	cfg.chBaseURL = stub.URL
+	// ttl 0: nothing is ever fresh, so every check would probe if it were not for
+	// the in-flight guard — and the test needs no sleep to expire a cache.
+	rc := newReadinessCache(cfg, newMetrics("", "", ""), 0)
+	if !rc.check() {
+		t.Fatal("the first probe should report ready")
+	}
+
+	probing := make(chan struct{})
+	go func() {
+		defer close(probing)
+		rc.check() // blocks inside the stub until release
+	}()
+	defer func() {
+		close(release)
+		select {
+		case <-probing:
+		case <-time.After(5 * time.Second):
+			t.Error("the blocked probe never finished")
+		}
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second probe never reached ClickHouse")
+	}
+
+	if !rc.check() {
+		t.Fatal("a check made while a probe is in flight must serve the last value, not a fresh failure")
+	}
+	if got := probes.Load(); got != 2 {
+		t.Fatalf("probes = %d, want 2: the third check fired its own query instead of reusing the in-flight one", got)
 	}
 }

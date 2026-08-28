@@ -25,7 +25,15 @@
             <max_execution_time>30</max_execution_time>
             <max_threads>2</max_threads>
             <max_result_rows>200000</max_result_rows>
-            <result_overflow_mode>break</result_overflow_mode>
+            <!-- 'throw' (TOO_MANY_ROWS), NOT 'break'. The reader is consumed by an
+                 agent/script that cannot see the cap was hit: 'break' stops the
+                 query and returns a partial result as if it were the whole one, so
+                 a GROUP BY over more than 200000 groups silently answers the wrong
+                 aggregate. Failing loudly costs one retry with a LIMIT or a narrower
+                 window; a silently truncated answer costs a wrong decision. Memory is
+                 protected either way — 'throw' also aborts the query at the cap, and
+                 max_memory_usage/max_execution_time are the real guards. -->
+            <result_overflow_mode>throw</result_overflow_mode>
         </readonly>
     </profiles>
 </clickhouse>

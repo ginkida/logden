@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/rand"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -126,5 +127,56 @@ func TestGzipBombIsNotFullyDecompressed(t *testing.T) {
 	}
 	if n, _ := req.Body.Read(make([]byte, 1)); n == 0 {
 		t.Fatal("the whole compressed body was consumed: the decompressed stream is not capped")
+	}
+}
+
+// /readyz is what the container orchestrator and the load balancer act on, and
+// the only writer of logden_clickhouse_reachable besides the background loop —
+// two alert rules in deploy/alerts.yml read that gauge. Neither the handler nor
+// the gauge had a test.
+func TestReadyzReflectsClickHouseState(t *testing.T) {
+	cases := []struct {
+		name      string
+		chStatus  int
+		chBody    string
+		wantCode  int
+		wantBody  string
+		wantGauge string
+	}{
+		{"clickhouse answers the probe", http.StatusOK, "1\n", http.StatusOK, "ready", "1"},
+		{"clickhouse errors", http.StatusInternalServerError, "", http.StatusServiceUnavailable, "clickhouse unreachable", "0"},
+		// A 200 whose body is not "1" is not a working query path either: the probe
+		// checks the answer, not just the status line.
+		{"clickhouse answers garbage", http.StatusOK, "Code: 81", http.StatusServiceUnavailable, "clickhouse unreachable", "0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.chStatus)
+				_, _ = io.WriteString(w, tc.chBody)
+			}))
+			defer stub.Close()
+
+			cfg := testConfig()
+			cfg.chBaseURL = stub.URL
+			s := newServer(cfg) // a fresh cache, so this request does probe
+
+			rr := httptest.NewRecorder()
+			s.mux().ServeHTTP(rr, httptest.NewRequest("GET", "/readyz", nil))
+			if rr.Code != tc.wantCode {
+				t.Fatalf("want %d got %d (%s)", tc.wantCode, rr.Code, rr.Body.String())
+			}
+			if !strings.Contains(rr.Body.String(), tc.wantBody) {
+				t.Fatalf("body = %q, want it to contain %q", rr.Body.String(), tc.wantBody)
+			}
+
+			out := s.m.render()
+			if want := `logden_http_requests_total{path="/readyz",code="` + itoa(tc.wantCode) + `"} 1`; !strings.Contains(out, want) {
+				t.Errorf("metrics missing %q\n%s", want, out)
+			}
+			if want := "logden_clickhouse_reachable " + tc.wantGauge + "\n"; !strings.Contains(out, want) {
+				t.Errorf("metrics missing %q: the alert keys on this gauge", want)
+			}
+		})
 	}
 }

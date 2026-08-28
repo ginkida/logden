@@ -86,10 +86,14 @@ func knownPath(p string) string {
 
 func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
+		// A 405 without Allow leaves the client guessing which method to use;
+		// RFC 9110 makes the header mandatory.
+		w.Header().Set("Allow", http.MethodPost)
 		s.reject(w, http.StatusMethodNotAllowed, "method")
 		return
 	}
 	if !s.authorized(r) {
+		w.Header().Set("WWW-Authenticate", bearerChallenge)
 		s.reject(w, http.StatusUnauthorized, "auth")
 		return
 	}
@@ -119,9 +123,28 @@ func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
 
 	accepted, dropped := s.ingest.enqueue(rows, s.clientIP(r))
 	s.m.received.Add(int64(accepted))
+	// Per-project attribution happens HERE, not inside enqueue(): the accept path
+	// runs under enqueueMu, which every /logs request serializes on, and a second
+	// map write inside it would add lock hold time to the pipeline's only global
+	// mutex. enqueue returns just the totals, but that is enough, because it is
+	// all-or-nothing: the batch either entered the buffer or it did not, so the
+	// first `accepted` rows are exactly the ones that made it (accepted+dropped
+	// always equals len(rows), so the per-project totals add up to the global
+	// counters either way).
+	s.m.projects.observe(rows, accepted)
 	if dropped > 0 {
 		s.m.dropped.Add(int64(dropped))
-		http.Error(w, "buffer full, retry later", http.StatusServiceUnavailable)
+		// Every 503 the gateway sheds carries Retry-After, as README and AGENTS
+		// promise; the status line is written after the header, so it has to be
+		// set first. Deliberately NOT routed through reject(): a buffer-full drop
+		// is counted by logden_logs_dropped_total alone, and deploy/alerts.yml
+		// keys a separate rule on the rejected counter that a second increment
+		// would fire. It still answers the same JSON shape as every other /logs
+		// error, so a client parses one body format; "buffer_full" is a
+		// response-only string and is deliberately absent from the
+		// logden_logs_rejected_total vocabulary.
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusServiceUnavailable, "buffer_full")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -151,6 +174,7 @@ func (s *server) handleVersion(w http.ResponseWriter, _ *http.Request) {
 
 func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.metricsToken != "" && !secureEqual(bearer(r), s.cfg.metricsToken) {
+		w.Header().Set("WWW-Authenticate", bearerChallenge)
 		http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 		return
 	}
@@ -162,8 +186,32 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 // countRequests, which sees every response.
 func (s *server) reject(w http.ResponseWriter, code int, reason string) {
 	s.m.rejected.inc(`reason="` + reason + `"`)
-	http.Error(w, http.StatusText(code), code)
+	writeError(w, code, reason)
 }
+
+// writeError answers a /logs failure with the reason in a machine-readable body.
+// A bare "Bad Request" left the reason visible only inside
+// logden_logs_rejected_total, i.e. only to whoever runs the gateway: the sender
+// could not tell an invalid project name from an oversized body, and the two
+// need opposite fixes. Only /logs uses this — /metrics, /readyz and /healthz keep
+// the plain-text bodies scrapers and container probes already expect.
+//
+// The JSON is concatenated rather than encoded because every reason is a
+// compile-time literal from the closed vocabulary that feeds the rejected
+// counter (lowercase and underscores only), which is the same invariant
+// labeledCounter relies on: no user input reaches this string, so there is
+// nothing to escape and nothing to reflect. Never pass a caller-supplied value.
+func writeError(w http.ResponseWriter, code int, reason string) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(code)
+	_, _ = io.WriteString(w, `{"error":"`+reason+`"}`+"\n")
+}
+
+// bearerChallenge is the challenge RFC 9110 requires on a 401. Without it a
+// client cannot tell a missing-credentials failure from a blanket refusal, and
+// generic HTTP clients never offer the token they were configured with.
+// /logs and /metrics take different secrets but the same scheme.
+const bearerChallenge = `Bearer realm="logden"`
 
 // authorized compares the presented token against every valid token in
 // constant time and WITHOUT early exit (supports rotation: several tokens at once).
@@ -182,7 +230,8 @@ func (s *server) authorized(r *http.Request) bool {
 }
 
 // reasonOverloaded is the rejection reason for admission control (503): it also
-// selects the Retry-After header, so it must match on both paths.
+// selects the Retry-After header among the parse-path rejections, so it must
+// match on both paths.
 const reasonOverloaded = "overloaded"
 
 // errOverloaded aborts a body read that would exceed MAX_INFLIGHT_BODY_BYTES.
@@ -264,20 +313,102 @@ func (m *meteredReader) Read(p []byte) (int, error) {
 
 // clientIP trusts X-Forwarded-For only when the connection comes from a
 // trusted proxy (TRUSTED_PROXIES); otherwise it uses the real peer.
+//
+// The chain is walked RIGHT TO LEFT. The leftmost entry is whatever the client
+// typed: every appending proxy — nginx's $proxy_add_x_forwarded_for, Caddy's
+// reverse_proxy — forwards "<client-supplied value>, <peer it actually saw>",
+// so reading element 0 let a client forge source_ip in exactly the reverse-proxy
+// deployment SECURITY.md recommends. The price of the fix is that every hop in
+// front of the gateway must be listed in TRUSTED_PROXIES, or source_ip records
+// the nearest unlisted hop instead of the end client.
 func (s *server) clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
 	}
-	if len(s.cfg.trustedProxies) > 0 && isTrusted(net.ParseIP(host), s.cfg.trustedProxies) {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			cand := strings.TrimSpace(strings.Split(xff, ",")[0])
-			if net.ParseIP(cand) != nil {
-				return cand
+	if len(s.cfg.trustedProxies) == 0 || !isTrusted(net.ParseIP(host), s.cfg.trustedProxies) {
+		return host
+	}
+	if ip := forwardedFor(r.Header.Values("X-Forwarded-For"), s.cfg.trustedProxies); ip != "" {
+		return ip
+	}
+	return host
+}
+
+// maxForwardedHops bounds how far back forwardedFor walks. MaxHeaderBytes lets
+// a request carry a 32 KiB header, and real deployments have a handful of hops:
+// the cap stops a padded chain from turning every /logs request into thousands
+// of parse attempts. It examines the LAST N entries, so a long legitimate chain
+// still resolves to a near hop rather than silently collapsing to the peer.
+const maxForwardedHops = 16
+
+// forwardedFor returns the rightmost X-Forwarded-For entry that is not itself a
+// trusted proxy, or "" when the chain yields nothing usable and the caller must
+// keep the real peer.
+//
+// It takes every header line, not Get's first one: Go does not merge repeated
+// headers, so a client that sends its own X-Forwarded-For line keeps that line
+// ahead of the one the proxy adds, and scanning Get's value alone would still
+// return the forged address. Per RFC 7230 repeated lines are one ordered list,
+// so the last line holds the most recent hops.
+//
+// The scan walks commas from the end with LastIndexByte instead of splitting:
+// a 32 KiB header would otherwise allocate a multi-thousand-element slice on the
+// hottest path, under an 80 MiB memory budget.
+func forwardedFor(values []string, trusted []*net.IPNet) string {
+	leftmost := ""
+	hops := 0
+	for i := len(values) - 1; i >= 0 && hops < maxForwardedHops; i-- {
+		rest := values[i]
+		for hops < maxForwardedHops {
+			entry := rest
+			if c := strings.LastIndexByte(rest, ','); c >= 0 {
+				entry, rest = rest[c+1:], rest[:c]
+			} else {
+				rest = ""
+			}
+			hops++
+			ip, text := parseForwardedEntry(strings.TrimSpace(entry))
+			if ip == nil {
+				// An entry we cannot parse means the rest of the chain no longer
+				// says anything reliable about who is upstream: fail closed onto
+				// the peer rather than record an attacker-chosen string.
+				return ""
+			}
+			// isTrusted must see the parsed address, not the text, or an
+			// IPv4-mapped IPv6 form would slip past the operator's CIDRs.
+			if !isTrusted(ip, trusted) {
+				return text
+			}
+			// Everything so far is a known proxy. Keep the furthest one: when the
+			// whole chain is trusted the sender itself lives inside TRUSTED_PROXIES
+			// (an internal service behind the same proxy), and the leftmost entry
+			// identifies it, whereas the peer would collapse every such sender onto
+			// the proxy address.
+			leftmost = text
+			if rest == "" {
+				break
 			}
 		}
 	}
-	return host
+	return leftmost
+}
+
+// parseForwardedEntry parses one chain entry and returns the address plus its
+// textual form. Both are substrings of the header, so the walk stays allocation
+// free apart from the parsed IP itself.
+func parseForwardedEntry(entry string) (net.IP, string) {
+	if ip := net.ParseIP(entry); ip != nil {
+		return ip, entry
+	}
+	// Some proxies (Azure Front Door, HAProxy) append "ip:port" entries; the port
+	// has no place in source_ip, so only the host survives.
+	if host, _, err := net.SplitHostPort(entry); err == nil {
+		if ip := net.ParseIP(host); ip != nil {
+			return ip, host
+		}
+	}
+	return nil, ""
 }
 
 // byteSemaphore caps the total estimated body bytes processed concurrently.

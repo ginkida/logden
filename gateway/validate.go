@@ -162,6 +162,21 @@ func (s *server) parseBatch(r *http.Request, res *reservation) ([]row, int, stri
 	// same error).
 	rows := make([]row, 0, len(raws))
 	for _, raw := range raws {
+		if !utf8.Valid(raw) {
+			// Sanitize run-wise BEFORE the decoder sees the element: json.Unmarshal
+			// turns EVERY invalid byte inside a string into a 3-byte U+FFFD, so a
+			// 4KB run of binary garbage in `message` decodes — and re-serializes —
+			// as 12KB, three times the bytes the inflight budget was charged for
+			// and past the "rows <= 2x body" budget the BUFFER_MAX_BYTES floor is
+			// built on. bytes.ToValidUTF8 collapses a whole run into a single
+			// replacement instead. Invalid bytes can only sit inside string
+			// literals, so the element stays valid JSON, and the scan only costs a
+			// copy on the rare body that is actually malformed. The bytes variant
+			// is deliberate: the strings one costs three full-size copies of the
+			// element (to string, into the Builder, back to RawMessage) on a path
+			// whose whole point is bounding what a 4 MiB body can allocate.
+			raw = bytes.ToValidUTF8(raw, []byte("�"))
+		}
 		var e inEvent
 		if err := json.Unmarshal(raw, &e); err != nil {
 			s.m.rejected.inc(`reason="invalid_event"`)
@@ -202,13 +217,26 @@ func (s *server) buildRow(e inEvent) (row, bool) {
 		}
 		// the result is always <= maxMessageBytes
 	}
-	ts := normalizeTimestamp(e.Timestamp, s.cfg.retention)
+	ts, skew := normalizeEventTime(e.Timestamp, s.cfg.retention)
 	if ts == "" {
 		// Stamp at INGEST time instead of leaving the column to ClickHouse's
 		// DEFAULT now64(3), which is applied at INSERT time: a batch that sits in
 		// the spool through a ClickHouse outage would otherwise be stored with the
 		// replay time, hours after the event actually happened.
 		ts = time.Now().UTC().Format(chTimeLayout)
+		// Overwriting a timestamp the sender DID provide is the last silent
+		// data mutation in the pipeline: a fleet with a skewed clock or a
+		// backfill older than RETENTION lands entirely under the ingest time and
+		// still looks perfectly healthy. The switch keeps the hot path free of
+		// allocation (both labels are compile-time literals, like every other
+		// value handed to labeledCounter) and counts only a discarded client
+		// time — an event that simply carried no timestamp is normal traffic.
+		switch skew {
+		case skewFuture:
+			s.m.restamped.inc(`reason="future"`)
+		case skewTooOld:
+			s.m.restamped.inc(`reason="too_old"`)
+		}
 	}
 	ctx, ctxTruncated := normalizeContext(e.Context, s.cfg.maxContextBytes)
 	if ctxTruncated {
@@ -253,6 +281,9 @@ func normalizeContext(raw json.RawMessage, max int) (string, bool) {
 		// encoder rewrites every such byte as the 6-byte � escape — a binary
 		// context would serialize ~6x its input size and break the
 		// "rows <= 2x body" budget the BUFFER_MAX_BYTES floor is built on.
+		// parseBatch already sanitizes whole elements, which makes this branch
+		// unreachable from /logs — it stays because normalizeContext and buildRow
+		// are also called directly, and losing it there loses that 6x bound.
 		t = []byte(strings.ToValidUTF8(string(t), "�"))
 	}
 	if len(t) > max {
@@ -261,30 +292,47 @@ func normalizeContext(raw json.RawMessage, max int) (string, bool) {
 	return string(t), false
 }
 
-// normalizeTimestamp accepts RFC3339 or unix (sec/ms). Returns the time in
-// ClickHouse format, or "" when the client sent nothing usable (buildRow then
-// stamps the ingest time). Junk protection: anything more than +5min in the
-// future or older than the retention is dropped.
+// Skew classes for a client timestamp that parsed but failed the range check.
+// They exist so buildRow can count what it silently overwrites; skewNone covers
+// both "nothing to report" and "nothing parseable was sent".
+const (
+	skewNone   = ""
+	skewFuture = "future"
+	skewTooOld = "too_old"
+)
+
+// normalizeTimestamp is normalizeEventTime without the skew class, for callers
+// that only want the stored value.
 func normalizeTimestamp(raw json.RawMessage, retention time.Duration) string {
+	ts, _ := normalizeEventTime(raw, retention)
+	return ts
+}
+
+// normalizeEventTime accepts RFC3339 or unix (sec/ms). Returns the time in
+// ClickHouse format, or "" when the client sent nothing usable (buildRow then
+// stamps the ingest time), plus the reason a well-formed client time was thrown
+// away. Junk protection: anything more than +5min in the future or older than
+// the retention is dropped.
+func normalizeEventTime(raw json.RawMessage, retention time.Duration) (string, string) {
 	raw = bytes.TrimSpace(raw)
 	if len(raw) == 0 || string(raw) == "null" {
-		return ""
+		return "", skewNone
 	}
 	var t time.Time
 	if raw[0] == '"' {
 		var str string
 		if err := json.Unmarshal(raw, &str); err != nil {
-			return ""
+			return "", skewNone
 		}
 		parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(str))
 		if err != nil {
-			return ""
+			return "", skewNone
 		}
 		t = parsed
 	} else {
 		f, err := strconv.ParseFloat(string(raw), 64)
 		if err != nil {
-			return ""
+			return "", skewNone
 		}
 		if f > 1e12 {
 			t = time.UnixMilli(int64(f))
@@ -295,8 +343,11 @@ func normalizeTimestamp(raw json.RawMessage, retention time.Duration) string {
 	}
 	t = t.UTC()
 	now := time.Now().UTC()
-	if t.After(now.Add(5*time.Minute)) || t.Before(now.Add(-retention)) {
-		return ""
+	if t.After(now.Add(5 * time.Minute)) {
+		return "", skewFuture
 	}
-	return t.Format(chTimeLayout)
+	if t.Before(now.Add(-retention)) {
+		return "", skewTooOld
+	}
+	return t.Format(chTimeLayout), skewNone
 }

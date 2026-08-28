@@ -1,10 +1,21 @@
 <?xml version="1.0"?>
 <!--
-  default needs access management so the init script can create writer/reader.
-  We restrict default to loopback only: init and the healthcheck connect locally,
-  while from the docker network (from the gateway) the writer/reader use their own
-  credentials. This closes off access to the passwordless default from the network
-  without touching init.
+  'default' needs access management so the init script can create writer/reader.
+  We restrict 'default' to loopback: init (docker/initdb/20-users.sh) runs inside
+  the container and connects over 127.0.0.1, while everything arriving from the
+  docker network - the gateway - authenticates as writer or reader with its own
+  credentials. That closes the passwordless 'default' account off from the
+  network without touching init.
+
+  Worth knowing before editing the healthcheck in docker-compose.yml: it must not
+  be a clickhouse-client probe aimed at the service name. From that address the
+  source is the container's own docker-network IP rather than 127.0.0.1, this
+  mapping rejects 'default', and the container would never turn healthy. The
+  healthcheck uses the unauthenticated HTTP /ping endpoint instead.
+
+  Bare metal uses this file too (README): it is what lets clickhouse/users.sql
+  run as 'default'. Access management may be revoked once the users exist, at the
+  cost of having to grant it again before the next password rotation.
 -->
 <clickhouse>
     <users>

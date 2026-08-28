@@ -36,13 +36,17 @@ func (c config) validate() error {
 	add(c.spoolMaxBytes < 0, "SPOOL_MAX_BYTES must be >= 0 (0 = unlimited)")
 	add(c.maxInflightBytes < 0, "MAX_INFLIGHT_BODY_BYTES must be >= 0 (0 = unlimited)")
 	// Rows re-serialize LARGER than the raw body (context is re-escaped, a
-	// per-row source_ip is added), by up to ~2x for quote-dense payloads — so
-	// the buffer floor is 2× MAX_BODY_BYTES to keep one max-size request always
-	// enqueueable on an empty buffer. It is a floor, not the worst case: a body
-	// of invalid UTF-8 reaches ~3x, because the JSON decoder expands every bad
-	// byte in `message` into a 3-byte U+FFFD before the row is built (the
-	// shipped defaults leave 8x, so only a config pinned at the floor would ever
-	// see such a request rejected). The inflight floor only needs 1×: that
+	// per-row source_ip is added), by up to ~2x — so the buffer floor is 2×
+	// MAX_BODY_BYTES to keep one max-size request always enqueueable on an empty
+	// buffer. It is a floor, not a proven ceiling: any payload whose every byte
+	// re-encodes 2:1 lands a hair above it (measured at 2.00x for a context of
+	// raw U+2028/U+2029, which the encoder always escapes, and for invalid bytes
+	// alternating with valid ones; quote-dense ASCII is milder at ~1.7x), so a
+	// config pinned exactly at the floor answers 503 to such a request instead of
+	// buffering it — the shipped defaults leave 8×. What parseBatch's run-wise
+	// sanitizer removed is the shape that beat the floor outright: a solid run of
+	// invalid UTF-8 reached ~3x, because the JSON decoder expands every bad byte
+	// in `message` into a 3-byte U+FFFD. The inflight floor only needs 1×: that
 	// budget is charged for the raw bytes read, not for the rows.
 	add(c.bufferMaxBytes > 0 && c.bufferMaxBytes < 2*c.maxBodyBytes,
 		"BUFFER_MAX_BYTES must be >= 2× MAX_BODY_BYTES (serialized rows are larger than the raw body)")
@@ -58,6 +62,15 @@ func (c config) validate() error {
 		// silently points every insert at something that is not ClickHouse's
 		// query handler.
 		errs = append(errs, "CLICKHOUSE_URL must not contain a path")
+	case u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.User != nil:
+		// Same concatenation, same breakage: a fragment swallows the entire
+		// "?query=INSERT ..." — ClickHouse then parses the NDJSON body as SQL,
+		// answers 400, and every batch is spooled and quarantined as .bad — while
+		// a query string (or a bare "?") makes the join emit a second "?", so the
+		// settings arrive as one unknown parameter and ClickHouse refuses them.
+		// Credentials cannot work either: the gateway authenticates with the
+		// X-ClickHouse-* headers, and the URL is logged verbatim at startup.
+		errs = append(errs, "CLICKHOUSE_URL must be scheme://host[:port] only - no query, fragment or credentials")
 	}
 
 	if len(errs) > 0 {

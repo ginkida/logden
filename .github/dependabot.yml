@@ -1,19 +1,32 @@
 version: 2
 updates:
+  # One entry per Go module: the repo is multi-module with no go.work, so
+  # Dependabot only sees the go.mod in the directory it is pointed at, and
+  # /gateway alone left two modules unwatched. All three are zero-dependency by
+  # policy, which makes these entries a watch on the Go directive and toolchain
+  # - the only Go supply chain this repo has.
   - package-ecosystem: gomod
     directory: /gateway
     schedule:
       interval: weekly
+  - package-ecosystem: gomod
+    directory: /clients/go
+    schedule:
+      interval: weekly
+  - package-ecosystem: gomod
+    directory: /tools/loadtest
+    schedule:
+      interval: weekly
+  # Workflow actions are pinned by commit SHA, so this is the only thing that
+  # ever moves them.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+  # The base images in gateway/Dockerfile. There is no Dockerfile at the repo
+  # root, so an entry for / matched nothing at all.
   - package-ecosystem: docker
     directory: /gateway
-    schedule:
-      interval: weekly
-  - package-ecosystem: docker
-    directory: /
     schedule:
       interval: weekly
   # tracks the pinned ClickHouse image in docker-compose.yml

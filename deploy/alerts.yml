@@ -88,6 +88,40 @@ groups:
             Requests rejected by admission control (MAX_INFLIGHT_BODY_BYTES) or the rate
             limiter. Clients do not retry, so this is log loss — raise the caps or the limit.
 
+      - alert: LogdenProjectSilent
+        expr: increase(logden_project_logs_received_total{project!="<overflow>"}[6h]) == 0
+        for: 30m
+        labels: { severity: warning }
+        annotations:
+          summary: "A project stopped sending logs (6h)"
+          description: >-
+            No events accepted from this project while the gateway keeps ingesting others —
+            a dead sender, a wrong token or a broken network path. Only projects seen since
+            the last gateway restart are watched; exclude nightly senders with a project!=
+            matcher rather than widening the window.
+
+      - alert: LogdenProjectLabelsExhausted
+        expr: logden_project_labels_tracked >= logden_project_labels_capacity
+        for: 30m
+        labels: { severity: warning }
+        annotations:
+          summary: "Per-project metrics label cap reached"
+          description: >-
+            New projects now fold into project="<overflow>", so per-project silence and
+            spikes are no longer visible for them. Usually a sender generating a fresh
+            project name per event — check the overflow bucket's rate first.
+
+      - alert: LogdenTimestampsRestamped
+        expr: increase(logden_logs_restamped_total[15m]) > 100
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "Client timestamps being rewritten"
+          description: >-
+            Events arrive more than 5m in the future or older than RETENTION, so the gateway
+            stores its own ingest time and the real event time is lost. Fix the sender's
+            clock (reason=future) or raise RETENTION to cover the backfill (reason=too_old).
+
       - alert: LogdenInsertLatencyHigh
         expr: histogram_quantile(0.99, sum(rate(logden_clickhouse_insert_duration_seconds_bucket[5m])) by (le)) > 2
         for: 10m
