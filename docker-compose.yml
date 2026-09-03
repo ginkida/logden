@@ -8,7 +8,7 @@ x-logging: &logging
 
 services:
   clickhouse:
-    image: clickhouse/clickhouse-server:24.8@sha256:1ffa82edee000a42c09313bd9f1293d94c570aee74babc1b3ca9983a35fa597b
+    image: clickhouse/clickhouse-server:26.8@sha256:fa394da808cc53f76d0344429421d6c422a6ee85fe7450135c0e3cff4df9bcbb
     restart: unless-stopped
     # The same 60s the gateway gets, for a connected reason: compose stops in
     # reverse dependency order, so the gateway drains into a live ClickHouse and
